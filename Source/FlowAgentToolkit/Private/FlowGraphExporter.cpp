@@ -126,14 +126,12 @@ void UFlowGraphExporter::BuildDocumentNodes(const UFlowAsset* FlowAsset, FFlowAg
 		// appends the complete set for this node.
 		Op.bReplaceAddons = true;
 
-		#if WITH_EDITOR
 		if (const UEdGraphNode* EdGraphNode = Node->GetGraphNode())
 		{
 			Op.bHasPosition = true;
 			Op.Position = FIntPoint(EdGraphNode->NodePosX, EdGraphNode->NodePosY);
 			Op.Comment = EdGraphNode->NodeComment;
 		}
-		#endif
 
 		const UFlowNode* DefaultNode = Cast<UFlowNode>(Node->GetClass()->GetDefaultObject());
 

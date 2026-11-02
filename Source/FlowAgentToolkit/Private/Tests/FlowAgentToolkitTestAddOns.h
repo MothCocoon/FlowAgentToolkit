@@ -44,9 +44,7 @@ public:
 	UPROPERTY(EditAnywhere, Category = "FlowAgent Test")
 	FFlowAgentToolkitTestCachedPinSettings Settings;
 
-#if WITH_EDITOR
 	virtual void PostEditChangeChainProperty(FPropertyChangedChainEvent& PropertyChangedEvent) override;
-#endif
 
 private:
 	// Rebuilds OutputPins from the authored properties after the callback normalizes them.

@@ -119,7 +119,6 @@ FFlowAgentDocWriteResult FFlowAgentDocWriter::Write(
 	Result.ClassPath = TargetClass->GetPathName();
 	Result.Origin = UFlowCatalogQuery::GetClassOrigin(TargetClass);
 
-#if WITH_EDITOR
 	UFlowNodeBase* DefaultNode = Cast<UFlowNodeBase>(TargetClass->GetDefaultObject());
 	if (!DefaultNode)
 	{
@@ -188,8 +187,4 @@ FFlowAgentDocWriteResult FFlowAgentDocWriter::Write(
 		Result.Note = TEXT("Dry run - nothing was written. Re-run with bDryRun false to apply.");
 	}
 	return Result;
-#else
-	Result.ErrorMessage = TEXT("Agent docs can only be authored in an editor build.");
-	return Result;
-#endif
 }

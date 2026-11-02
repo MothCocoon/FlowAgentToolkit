@@ -2251,7 +2251,6 @@ void FFlowGraphImporterSpec::Define()
 				TestNotNull("Imported asset should not be null", TestFlowAsset);
 				if (!TestFlowAsset) { AddError(FString::Printf(TEXT("Import failed: %s"), *ErrorMessage)); return; }
 
-#if WITH_EDITOR
 				const TArray<FName>& Inputs  = TestFlowAsset->GetCustomInputs();
 				const TArray<FName>& Outputs = TestFlowAsset->GetCustomOutputs();
 
@@ -2260,7 +2259,6 @@ void FFlowGraphImporterSpec::Define()
 
 				TestEqual("CustomOutputs should have one entry", Outputs.Num(), 1);
 				if (Outputs.Num() == 1) { TestEqual("CustomOutput name should be Done", Outputs[0], FName("Done")); }
-#endif
 			});
 		});
 

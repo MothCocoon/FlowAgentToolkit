@@ -533,7 +533,6 @@ EFlowClassOrigin UFlowCatalogQuery::GetClassOrigin(const UClass* NodeOrAddOnClas
 		return EFlowClassOrigin::AngelScript;
 	}
 
-#if WITH_EDITOR
 	// Only the header tool emits ModuleRelativePath, so its presence is a reliable "compiled from a
 	// .h/.cpp" marker that distinguishes native classes from any script VM's generated ones.
 	static const FName NAME_ModuleRelativePath(TEXT("ModuleRelativePath"));
@@ -542,9 +541,6 @@ EFlowClassOrigin UFlowCatalogQuery::GetClassOrigin(const UClass* NodeOrAddOnClas
 		return EFlowClassOrigin::Native;
 	}
 	return EFlowClassOrigin::Unknown;
-#else
-	return EFlowClassOrigin::Native;
-#endif
 }
 
 bool UFlowCatalogQuery::IsClassDeprecated(const UClass* NodeOrAddOnClass)
@@ -578,7 +574,6 @@ void UFlowCatalogQuery::GatherAgentDoc(const UClass* NodeOrAddOnClass, FFlowCata
 	OutDoc = FFlowCatalogDocRow();
 	OutArticles.Reset();
 
-#if WITH_EDITOR
 	const UFlowNodeBase* DefaultNode = NodeOrAddOnClass ? Cast<UFlowNodeBase>(NodeOrAddOnClass->GetDefaultObject()) : nullptr;
 	if (!DefaultNode)
 	{
@@ -607,7 +602,6 @@ void UFlowCatalogQuery::GatherAgentDoc(const UClass* NodeOrAddOnClass, FFlowCata
 	{
 		OutArticles.Add(Article.ToString());
 	}
-#endif
 }
 
 FFlowCatalogClassRow UFlowCatalogQuery::BuildRow(const UClass* Class, bool bIsAddon, const FFlowCatalogQueryParams& Params)
@@ -677,7 +671,6 @@ void UFlowCatalogQuery::ListAssetTypes(TArray<FFlowCatalogAssetTypeRow>& OutAsse
 {
 	OutAssetTypes.Reset();
 
-#if WITH_EDITOR
 	TArray<UClass*> NodeClasses;
 	GatherAllNodeClasses(NodeClasses);
 
@@ -718,7 +711,6 @@ void UFlowCatalogQuery::ListAssetTypes(TArray<FFlowCatalogAssetTypeRow>& OutAsse
 
 		OutAssetTypes.Add(Row);
 	}
-#endif
 }
 
 void UFlowCatalogQuery::QueryCatalog(const FFlowCatalogQueryParams& Params, FFlowCatalogQueryResult& OutResult)
@@ -1367,7 +1359,6 @@ FString UFlowCatalogQuery::GetNodeDescription(const UClass* NodeOrAddOnClass)
 		return FString();
 	}
 	
-#if WITH_EDITOR
 	// UFlowNodeBase supplies tooltips for both nodes and addons.
 	if (const UFlowNodeBase* DefaultNode = Cast<UFlowNodeBase>(NodeOrAddOnClass->GetDefaultObject()))
 	{
@@ -1383,7 +1374,6 @@ FString UFlowCatalogQuery::GetNodeDescription(const UClass* NodeOrAddOnClass)
 	{
 		return ClassTooltip.ToString();
 	}
-#endif
 	
 	return FString();
 }
@@ -1395,12 +1385,10 @@ FString UFlowCatalogQuery::GetNodeCategory(const UClass* NodeOrAddOnClass)
 		return FString();
 	}
 
-#if WITH_EDITOR
 	if (const UFlowNodeBase* DefaultNode = Cast<UFlowNodeBase>(NodeOrAddOnClass->GetDefaultObject()))
 	{
 		return DefaultNode->GetNodeCategory();
 	}
-#endif
 	
 	return FString();
 }
@@ -1626,7 +1614,6 @@ void UFlowCatalogQuery::GatherPins(const UClass* NodeOrAddOnClass, TArray<FFlowC
 	OutInputPins.Reset();
 	OutOutputPins.Reset();
 
-#if WITH_EDITOR
 	// Cast<>() on the untyped CDO rather than GetDefaultObject<T>(), which would assert for a class
 	// outside the expected hierarchy instead of reporting "no pins".
 	const UFlowNodeBase* DefaultNode = NodeOrAddOnClass ? Cast<UFlowNodeBase>(NodeOrAddOnClass->GetDefaultObject()) : nullptr;
@@ -1700,7 +1687,6 @@ void UFlowCatalogQuery::GatherPins(const UClass* NodeOrAddOnClass, TArray<FFlowC
 	// unguardable: those implementations assert on the missing owner, and an ensure is a debug break
 	// rather than something a caller can catch or flag its way past. Pins that only exist on a real
 	// instance are reported by FindFlowNodeUsage, which reads shipped assets.
-#endif
 }
 
 FString UFlowCatalogQuery::GetPropertyTypeName(const FProperty* Property)
@@ -1825,13 +1811,11 @@ FString UFlowCatalogQuery::GetPropertyTooltip(const FProperty* Property)
 		return TEXT("");
 	}
 	
-#if WITH_EDITOR
 	FText Tooltip = Property->GetToolTipText();
 	if (!Tooltip.IsEmpty())
 	{
 		return Tooltip.ToString();
 	}
-#endif
 	
 	return TEXT("");
 }
@@ -1843,7 +1827,6 @@ FString UFlowCatalogQuery::GetPropertyPinBinding(const FProperty* Property)
 		return TEXT("-");
 	}
 	
-#if WITH_EDITOR
 	bool bIsOutputPin = Property->HasMetaData(FFlowPin::MetadataKey_SourceForOutputFlowPin);
 	bool bIsInputPin = Property->HasMetaData(FFlowPin::MetadataKey_DefaultForInputFlowPin);
 	bool bHasFlowPinType = Property->HasMetaData(FFlowPin::MetadataKey_FlowPinType);
@@ -1887,7 +1870,6 @@ FString UFlowCatalogQuery::GetPropertyPinBinding(const FProperty* Property)
 			}
 		}
 	}
-#endif
 	
 	return TEXT("-");
 }
@@ -1912,13 +1894,11 @@ bool UFlowCatalogQuery::CanNodeAddUserInputPins(const UClass* NodeClass)
 		return false;
 	}
 	
-#if WITH_EDITOR
 	const UFlowNode* DefaultNode = NodeClass->GetDefaultObject<UFlowNode>();
 	if (DefaultNode)
 	{
 		return DefaultNode->CanUserAddInput();
 	}
-#endif
 	
 	return false;
 }
@@ -1930,13 +1910,11 @@ bool UFlowCatalogQuery::CanNodeAddUserOutputPins(const UClass* NodeClass)
 		return false;
 	}
 	
-#if WITH_EDITOR
 	const UFlowNode* DefaultNode = NodeClass->GetDefaultObject<UFlowNode>();
 	if (DefaultNode)
 	{
 		return DefaultNode->CanUserAddOutput();
 	}
-#endif
 	
 	return false;
 }
@@ -1977,11 +1955,7 @@ void UFlowCatalogQuery::GatherAllAddOnClasses(TArray<UClass*>& OutAddOnClasses)
 
 FString UFlowCatalogQuery::GetNodeKeywords(const UClass* NodeClass)
 {
-#if WITH_EDITOR
 	return UFlowNodeBase::GetInheritedNodeKeywords(NodeClass);
-#else
-	return TEXT("");
-#endif
 }
 
 void UFlowCatalogQuery::GatherAllKeywords(
@@ -2006,13 +1980,11 @@ void UFlowCatalogQuery::GatherAllKeywords(
 
 		// Determine the display name: prefer DisplayName meta, else strip common prefixes
 		FString DisplayName;
-#if WITH_EDITOR
 		static const FName NAME_DisplayName(TEXT("DisplayName"));
 		if (Class->HasMetaData(NAME_DisplayName))
 		{
 			DisplayName = Class->GetMetaData(NAME_DisplayName);
 		}
-#endif
 		if (DisplayName.IsEmpty())
 		{
 			DisplayName = Class->GetName();

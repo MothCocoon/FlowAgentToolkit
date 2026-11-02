@@ -11,7 +11,6 @@ UFlowAgentToolkitTestCachedPinAddOn::UFlowAgentToolkitTestCachedPinAddOn()
 	RebuildOutputPins();
 }
 
-#if WITH_EDITOR
 // Exercise the callback contract used by cached AddOns: inspect the active member,
 // normalize final values, rebuild the AddOn cache, then request parent reconstruction.
 void UFlowAgentToolkitTestCachedPinAddOn::PostEditChangeChainProperty(FPropertyChangedChainEvent& PropertyChangedEvent)
@@ -57,7 +56,6 @@ void UFlowAgentToolkitTestCachedPinAddOn::PostEditChangeChainProperty(FPropertyC
 	RebuildOutputPins();
 	RequestReconstructionOnOwningFlowNode();
 }
-#endif
 
 void UFlowAgentToolkitTestCachedPinAddOn::RebuildOutputPins()
 {

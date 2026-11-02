@@ -717,7 +717,6 @@ FFlowMCPCheckAddonAttachmentEligibilityResult UFlowMCPToolset::CheckAddonAttachm
 		return Result;
 	}
 
-#if WITH_EDITOR
 	const TArray<UFlowNodeAddOn*> NoOtherAddOns;
 	const EFlowAddOnAcceptResult AcceptResult = ParentCDO->CheckAcceptFlowNodeAddOnChild(AddonCDO, NoOtherAddOns);
 
@@ -741,10 +740,6 @@ FFlowMCPCheckAddonAttachmentEligibilityResult UFlowMCPToolset::CheckAddonAttachm
 	}
 
 	return Result;
-#else
-	RaiseFlowGraphToolError(TEXT("CheckAddonAttachmentEligibility requires an editor build."));
-	return Result;
-#endif
 }
 
 namespace
@@ -1435,9 +1430,7 @@ FFlowMCPReconstructFlowGraphResult UFlowMCPToolset::ReconstructFlowGraph(
 		return Result;
 	}
 
-#if WITH_EDITOR
 	FlowAsset->RebuildCustomInterfaceLists();
-#endif
 
 	if (!CompleteMutation(FlowAsset, MutationContext, Result.Mutation))
 	{
@@ -2040,7 +2033,6 @@ FFlowMCPSearchFlowAssetsResult UFlowMCPToolset::SearchFlowAssets(
 	const FFlowMCPSearchFlowAssetsRequest& Request)
 {
 	FFlowMCPSearchFlowAssetsResult Result;
-#if WITH_EDITOR
 	if (Request.Query.IsEmpty())
 	{
 		RaiseFlowGraphToolError(TEXT("SearchFlowAssets: Query must not be empty."));
@@ -2164,8 +2156,4 @@ FFlowMCPSearchFlowAssetsResult UFlowMCPToolset::SearchFlowAssets(
 	Result.PinDirection = Request.PinDirection.ToLower();
 	Result.PinConnection = Request.PinConnection.ToLower();
 	return Result;
-#else
-	RaiseFlowGraphToolError(TEXT("SearchFlowAssets requires an editor build."));
-	return Result;
-#endif
 }

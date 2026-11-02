@@ -355,7 +355,6 @@ bool FFlowGraphReconciler::ComputePlanForNewAsset(
 	return true;
 }
 
-#if WITH_EDITOR
 namespace FlowGraphEffectiveStateDetail
 {
 	// Restore authored AddOn identity after DuplicateObject's lifecycle hooks, then reconnect each
@@ -654,7 +653,6 @@ namespace FlowGraphEffectiveStateDetail
 		return true;
 	}
 }
-#endif // WITH_EDITOR
 
 bool FFlowGraphReconciler::BuildEffectivePinSchema(
 	UFlowAsset* ExistingAsset,
@@ -666,7 +664,6 @@ bool FFlowGraphReconciler::BuildEffectivePinSchema(
 	OutErrorMessage.Reset();
 	OutProjectedPinSchema.Reset();
 
-#if WITH_EDITOR
 	// Validation must preview the exact AddOn-generated pins from the requested final state,
 	// because FlowAgent resolves connections before its live mutation begins.
 	FlowGraphEffectiveStateDetail::FFlowEffectivePinSchemaPreview Preview;
@@ -788,13 +785,6 @@ bool FFlowGraphReconciler::BuildEffectivePinSchema(
 		*OutEffectiveAsset = MoveTemp(Preview.Asset);
 	}
 	return true;
-#else
-	(void)ExistingAsset;
-	(void)ExecutionPlan;
-	(void)OutEffectiveAsset;
-	OutErrorMessage = TEXT("FlowAgent pin schema preview requires editor support");
-	return false;
-#endif // WITH_EDITOR
 }
 
 // new-asset execute: full import + regraph.
@@ -1067,10 +1057,8 @@ bool FFlowGraphReconciler::ApplyNodeChanges(
 			return false;
 		}
 
-#if WITH_EDITOR
 		// Descriptor properties determine auto pins, so refresh those before applying authored pin declarations.
 		ExistingNode->TryUpdateAutoDataPins();
-#endif
 		UFlowGraphImporter::ApplyDeclaredPins(ExistingNode, NodeToUpdate);
 	}
 
@@ -1133,7 +1121,6 @@ bool FFlowGraphReconciler::ApplyAddOnChanges(
 		return false;
 	}
 
-#if WITH_EDITOR
 	// Phase 4: refresh parent auto pins only after AddOn callbacks refreshed their cached pins.
 	for (const TPair<FGuid, UFlowNode*>& NewNodeEntry : NewNodeMap)
 	{
@@ -1153,7 +1140,6 @@ bool FFlowGraphReconciler::ApplyAddOnChanges(
 			ExistingNode->TryUpdateAutoDataPins();
 		}
 	}
-#endif
 
 	// Runtime endpoints must match the dry-run preview before any connection is written.
 	return FFlowGraphValidation::DoesRuntimePinSchemaMatchProjected(

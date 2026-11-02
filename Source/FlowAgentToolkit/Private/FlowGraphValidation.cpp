@@ -450,7 +450,6 @@ void FFlowGraphValidation::ValidateAddOnsRecursive(
 				OwnerNodeGuid, ParsedAddOn.AddOnGuid);
 		}
 
-#if WITH_EDITOR
 		// Attachment eligibility check. OwnerClass is null when a merge-update block omits Type: -
 		// skip in that case, as the addon attaches to the real existing node unchanged.
 		// CheckAcceptFlowNodeAddOnChild is queried on class-default objects. Only Reject fails;
@@ -472,7 +471,6 @@ void FFlowGraphValidation::ValidateAddOnsRecursive(
 				}
 			}
 		}
-#endif // WITH_EDITOR
 
 		// Recurse into addon-of-addon children, scoping GUID uniqueness to that owner.
 		ValidateAddOnsRecursive(TargetAsset, AddOnClass, OwnerNodeGuid, ParsedAddOn.AddOns, OutFindings);

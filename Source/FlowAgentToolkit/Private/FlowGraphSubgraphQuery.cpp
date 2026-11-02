@@ -15,12 +15,10 @@ FString FFlowGraphSubgraphQuery::ResolveNodeTitle(const UFlowNode* Node)
 		return TEXT("");
 	}
 
-#if WITH_EDITOR
 	if (const UEdGraphNode* EdGraphNode = Node->GetGraphNode())
 	{
 		return EdGraphNode->GetNodeTitle(ENodeTitleType::ListView).ToString();
 	}
-#endif
 
 	return Node->GetClass()->GetName();
 }

@@ -71,7 +71,6 @@ FFlowNodeBlueprintCreateResult FFlowNodeBlueprintCreator::Create(
 {
 	FFlowNodeBlueprintCreateResult Result;
 
-#if WITH_EDITOR
 	if (Request.PackagePath.IsEmpty())
 	{
 		Result.ErrorMessage = TEXT("PackagePath is required.");
@@ -272,8 +271,4 @@ FFlowNodeBlueprintCreateResult FFlowNodeBlueprintCreator::Create(
 	}
 
 	return Result;
-#else
-	Result.ErrorMessage = TEXT("Flow node Blueprints can only be created in an editor build.");
-	return Result;
-#endif
 }

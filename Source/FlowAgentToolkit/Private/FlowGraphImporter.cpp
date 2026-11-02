@@ -108,7 +108,6 @@ UFlowAsset* UFlowGraphImporter::ImportFlowGraphFromDocument(
 		return nullptr;
 	}
 
-#if WITH_EDITOR
 	// Refresh node auto data pins after AddOn callbacks have rebuilt their own cached pin arrays.
 	for (const TPair<FGuid, UFlowNode*>& NodeEntry : NodeMap)
 	{
@@ -117,7 +116,6 @@ UFlowAsset* UFlowGraphImporter::ImportFlowGraphFromDocument(
 			Node->TryUpdateAutoDataPins();
 		}
 	}
-#endif
 	// Refuse to wire if execution produced a schema different from the schema accepted by planning.
 	if (ProjectedPinSchema && !FFlowGraphValidation::DoesRuntimePinSchemaMatchProjected(
 		FlowAsset, *ProjectedPinSchema, OutErrorMessage))
@@ -131,10 +129,8 @@ UFlowAsset* UFlowGraphImporter::ImportFlowGraphFromDocument(
 		return nullptr;
 	}
 
-#if WITH_EDITOR
 	// Rebuild CustomInputs/CustomOutputs editor arrays so FlowNode_SubGraph context pins regenerate.
 	FlowAsset->RebuildCustomInterfaceLists();
-#endif
 
 	FAssetRegistryModule::AssetCreated(FlowAsset);
 	Package->MarkPackageDirty();
@@ -192,7 +188,6 @@ bool UFlowGraphImporter::PopulateFlowAssetFromDocument(
 		return false;
 	}
 
-#if WITH_EDITOR
 	// See the matching comment in ImportFlowGraphFromDocument.
 	for (const TPair<FGuid, UFlowNode*>& NodeEntry : NodeMap)
 	{
@@ -201,16 +196,13 @@ bool UFlowGraphImporter::PopulateFlowAssetFromDocument(
 			Node->TryUpdateAutoDataPins();
 		}
 	}
-#endif
 
 	if (!SetupConnections(TargetAsset, NodeMap, ParsedConnections, ParsedNodes, OutErrorMessage))
 	{
 		return false;
 	}
 
-#if WITH_EDITOR
 	TargetAsset->RebuildCustomInterfaceLists();
-#endif
 
 	TargetAsset->GetPackage()->MarkPackageDirty();
 
@@ -272,7 +264,6 @@ bool UFlowGraphImporter::CreateFlowNodes(UFlowAsset* FlowAsset, const TArray<FFl
 			return false;
 		}
 
-#if WITH_EDITOR
 		// Rebuild the pins a node generates from its own descriptor properties. The document never
 		// carries that state - the exporter writes editable properties only, on the contract that the
 		// node regenerates the rest. UFlowAsset::RegisterNode does this for a node created through the
@@ -280,7 +271,6 @@ bool UFlowGraphImporter::CreateFlowNodes(UFlowAsset* FlowAsset, const TArray<FFl
 		// Runs after SetNodeProperties because the descriptors are its input, and before
 		// ApplyDeclaredPins, which is idempotent and only fills in what is still missing.
 		NewNode->TryUpdateAutoDataPins();
-#endif
 
 		ApplyDeclaredPins(NewNode, ParsedNode);
 	}
@@ -880,7 +870,6 @@ void UFlowGraphImporter::SyncAddOnDataPinValueDirections(UFlowNodeAddOn* AddOn)
 }
 #endif
 
-#if WITH_EDITOR
 namespace FlowAddOnPropertyChangeDetail
 {
 	// Find the struct to inspect after a property segment, including the element type of struct arrays.
@@ -1092,14 +1081,12 @@ namespace FlowAddOnPropertyChangeDetail
 		return true;
 	}
 }
-#endif // WITH_EDITOR
 
 bool UFlowGraphImporter::DispatchPendingAddOnPropertyChanges(
 	const TArray<UFlowNodeBase*>& RootOwners,
 	const FFlowPendingAddOnPropertyChanges& PendingPropertyChanges,
 	FString& OutErrorMessage)
 {
-#if WITH_EDITOR
 	OutErrorMessage.Reset();
 
 	// Keep one scope per changed AddOn alive while callbacks dispatch across the completed trees.
@@ -1137,12 +1124,6 @@ bool UFlowGraphImporter::DispatchPendingAddOnPropertyChanges(
 		}
 	}
 	return true;
-#else
-	(void)RootOwners;
-	(void)PendingPropertyChanges;
-	(void)OutErrorMessage;
-	return true;
-#endif // WITH_EDITOR
 }
 
 bool UFlowGraphImporter::SetAddOnProperty(
@@ -1206,9 +1187,7 @@ bool UFlowGraphImporter::SetAddOnProperty(
 		AddOn->SetFlags(RF_Transactional);
 		AddOn->Modify();
 	}
-#if WITH_EDITOR
 	AddOn->PreEditChange(MemberProperty);
-#endif // WITH_EDITOR
 
 	// Write immediately but defer its callback until the complete AddOn tree has been reconciled.
 	FString InnerError;

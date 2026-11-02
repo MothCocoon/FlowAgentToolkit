@@ -318,12 +318,10 @@ namespace FlowGraphRegrapherDetail
 				RuntimeNode->SetGraphNode(ExistingGraphNode);
 				ExistingGraphNode->SetNodeTemplate(RuntimeNode);
 
-#if WITH_EDITOR
 				if (const FString* const Comment = NodeComments.Find(RuntimeNode->GetGuid()))
 				{
 					ExistingGraphNode->NodeComment = *Comment;
 				}
-#endif
 				continue;
 			}
 
@@ -362,12 +360,10 @@ namespace FlowGraphRegrapherDetail
 			// FFlowGraphSchemaAction_NewNode::CreateNode/ImportNode (which don't go through
 			// FGraphNodeCreator and so don't have this clobbering problem).
 			FlowGraphNode->NodeGuid = RuntimeNode->GetGuid();
-#if WITH_EDITOR
 			if (const FString* const Comment = NodeComments.Find(RuntimeNode->GetGuid()))
 			{
 				FlowGraphNode->NodeComment = *Comment;
 			}
-#endif
 		}
 		return true;
 	}
