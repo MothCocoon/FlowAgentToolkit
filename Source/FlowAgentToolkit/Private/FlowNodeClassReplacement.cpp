@@ -350,84 +350,6 @@ namespace
 	}
 }
 
-bool FFlowNodeClassReplacement::MapAddOns(
-	TArray<FFlowGraphParsedNodeAddOn>& AddOns,
-	const UFlowAsset& Asset,
-	const FFlowMCPReplaceFlowNodeClassRequest& Request,
-	TSet<FString>& SeenClassMappings,
-	TSet<FString>& SeenPropertyMappings,
-	TArray<FGuid>& ReplacedAddOnGuids,
-	TArray<FString>& OutFindings)
-{
-	for (FFlowGraphParsedNodeAddOn& AddOn : AddOns)
-	{
-		for (const TPair<FString, FString>& Mapping : Request.AddOnClassMappings)
-		{
-			FGuid Guid;
-			if (FGuid::Parse(Mapping.Key, Guid) && Guid == AddOn.AddOnGuid)
-			{
-				SeenClassMappings.Add(Mapping.Key);
-				if (AddOn.AddOnType != Mapping.Value)
-				{
-					UClass* NewClass = UFlowGraphImporter::ResolveNodeClass(Mapping.Value);
-					if (!NewClass || !NewClass->IsChildOf(UFlowNodeAddOn::StaticClass())
-						|| NewClass->HasAnyClassFlags(CLASS_Abstract))
-					{
-						OutFindings.Add(FString::Printf(TEXT("Invalid addon replacement class '%s' for GUID %s"),
-							*Mapping.Value, *Mapping.Key));
-						return false;
-					}
-					FText FailureReason;
-					if (!Asset.IsNodeOrAddOnClassAllowed(NewClass, &FailureReason))
-					{
-						OutFindings.Add(FString::Printf(TEXT("Addon replacement class '%s' is not allowed in asset '%s' for GUID %s: %s"),
-							*Mapping.Value, *Asset.GetClass()->GetName(), *Mapping.Key, *FailureReason.ToString()));
-						return false;
-					}
-					AddOn.AddOnType = NewClass->GetPathName();
-					ReplacedAddOnGuids.Add(AddOn.AddOnGuid);
-				}
-			}
-		}
-
-		for (const TPair<FString, FString>& Mapping : Request.AddOnPropertyMappings)
-		{
-			FString GuidText;
-			FString PropertyName;
-			FGuid Guid;
-			if (Mapping.Key.Split(TEXT("."), &GuidText, &PropertyName)
-				&& FGuid::Parse(GuidText, Guid) && Guid == AddOn.AddOnGuid)
-			{
-				SeenPropertyMappings.Add(Mapping.Key);
-				if (const FString* Value = AddOn.Properties.Find(PropertyName))
-				{
-					if (Mapping.Value != PropertyName && AddOn.Properties.Contains(Mapping.Value))
-					{
-						OutFindings.Add(FString::Printf(TEXT("Addon %s has conflicting property destination '%s'"),
-							*GuidText, *Mapping.Value));
-						return false;
-					}
-					const FString Copy = *Value;
-					AddOn.Properties.Remove(PropertyName);
-					AddOn.Properties.Add(Mapping.Value, Copy);
-				}
-				else
-				{
-					OutFindings.Add(FString::Printf(TEXT("Addon property '%s' is not exported on %s"),
-						*PropertyName, *GuidText));
-					return false;
-				}
-			}
-		}
-		if (!MapAddOns(AddOn.AddOns, Asset, Request, SeenClassMappings, SeenPropertyMappings,
-			ReplacedAddOnGuids, OutFindings))
-		{
-			return false;
-		}
-	}
-	return true;
-}
-
 bool FFlowNodeClassReplacement::BuildPlan(
 	const FFlowMCPReplaceFlowNodeClassRequest& Request,
 	FFlowNodeClassReplacementPlan& OutPlan,
@@ -687,42 +609,6 @@ bool FFlowNodeClassReplacement::BuildPlan(
 	return OutFindings.IsEmpty();
 }
 
-bool FFlowNodeClassReplacement::PairEditorAddOns(
-	const UFlowNodeBase& Original,
-	UFlowNodeBase& Replacement,
-	UFlowNode& RootNode,
-	TArray<FString>& OutFindings)
-{
-	const TArray<UFlowNodeAddOn*>& Before = Original.GetFlowNodeAddOnChildren();
-	const TArray<UFlowNodeAddOn*>& After = Replacement.GetFlowNodeAddOnChildren();
-	if (Before.Num() != After.Num())
-	{
-		OutFindings.Add(TEXT("Addon count changed during replacement."));
-		return false;
-	}
-	for (int32 Index = 0; Index < Before.Num(); ++Index)
-	{
-		UFlowNodeAddOn* OldAddOn = Before[Index];
-		UFlowNodeAddOn* NewAddOn = After[Index];
-		UFlowGraphNode* EditorAddOn = IsValid(OldAddOn) ? Cast<UFlowGraphNode>(OldAddOn->GetGraphNode()) : nullptr;
-		if (!IsValid(NewAddOn) || !IsValid(EditorAddOn) || OldAddOn->GetGuid() != NewAddOn->GetGuid()
-			|| !EditorAddOn->IsA(UFlowGraphSchema::GetAssignedGraphNodeClass(NewAddOn->GetClass())))
-		{
-			OutFindings.Add(TEXT("An addon has no matching GUID or compatible editor node."));
-			return false;
-		}
-		EditorAddOn->Modify();
-		EditorAddOn->SetNodeTemplate(NewAddOn);
-		NewAddOn->SetGraphNode(EditorAddOn);
-		NewAddOn->SetFlowNodeForEditor(&RootNode);
-		if (!PairEditorAddOns(*OldAddOn, *NewAddOn, RootNode, OutFindings))
-		{
-			return false;
-		}
-	}
-	return true;
-}
-
 bool FFlowNodeClassReplacement::ApplyPlan(
 	const FFlowNodeClassReplacementPlan& Plan,
 	TArray<FString>& OutFindings)
@@ -797,4 +683,118 @@ bool FFlowNodeClassReplacement::ApplyPlan(
 		VerifyExport(Plan, OutFindings);
 	}
 	return OutFindings.IsEmpty();
+}
+
+bool FFlowNodeClassReplacement::MapAddOns(
+	TArray<FFlowGraphParsedNodeAddOn>& AddOns,
+	const UFlowAsset& Asset,
+	const FFlowMCPReplaceFlowNodeClassRequest& Request,
+	TSet<FString>& SeenClassMappings,
+	TSet<FString>& SeenPropertyMappings,
+	TArray<FGuid>& ReplacedAddOnGuids,
+	TArray<FString>& OutFindings)
+{
+	for (FFlowGraphParsedNodeAddOn& AddOn : AddOns)
+	{
+		for (const TPair<FString, FString>& Mapping : Request.AddOnClassMappings)
+		{
+			FGuid Guid;
+			if (FGuid::Parse(Mapping.Key, Guid) && Guid == AddOn.AddOnGuid)
+			{
+				SeenClassMappings.Add(Mapping.Key);
+				if (AddOn.AddOnType != Mapping.Value)
+				{
+					UClass* NewClass = UFlowGraphImporter::ResolveNodeClass(Mapping.Value);
+					if (!NewClass || !NewClass->IsChildOf(UFlowNodeAddOn::StaticClass())
+						|| NewClass->HasAnyClassFlags(CLASS_Abstract))
+					{
+						OutFindings.Add(FString::Printf(TEXT("Invalid addon replacement class '%s' for GUID %s"),
+							*Mapping.Value, *Mapping.Key));
+						return false;
+					}
+					FText FailureReason;
+					if (!Asset.IsNodeOrAddOnClassAllowed(NewClass, &FailureReason))
+					{
+						OutFindings.Add(FString::Printf(TEXT("Addon replacement class '%s' is not allowed in asset '%s' for GUID %s: %s"),
+							*Mapping.Value, *Asset.GetClass()->GetName(), *Mapping.Key, *FailureReason.ToString()));
+						return false;
+					}
+					AddOn.AddOnType = NewClass->GetPathName();
+					ReplacedAddOnGuids.Add(AddOn.AddOnGuid);
+				}
+			}
+		}
+
+		for (const TPair<FString, FString>& Mapping : Request.AddOnPropertyMappings)
+		{
+			FString GuidText;
+			FString PropertyName;
+			FGuid Guid;
+			if (Mapping.Key.Split(TEXT("."), &GuidText, &PropertyName)
+				&& FGuid::Parse(GuidText, Guid) && Guid == AddOn.AddOnGuid)
+			{
+				SeenPropertyMappings.Add(Mapping.Key);
+				if (const FString* Value = AddOn.Properties.Find(PropertyName))
+				{
+					if (Mapping.Value != PropertyName && AddOn.Properties.Contains(Mapping.Value))
+					{
+						OutFindings.Add(FString::Printf(TEXT("Addon %s has conflicting property destination '%s'"),
+							*GuidText, *Mapping.Value));
+						return false;
+					}
+					const FString Copy = *Value;
+					AddOn.Properties.Remove(PropertyName);
+					AddOn.Properties.Add(Mapping.Value, Copy);
+				}
+				else
+				{
+					OutFindings.Add(FString::Printf(TEXT("Addon property '%s' is not exported on %s"),
+						*PropertyName, *GuidText));
+					return false;
+				}
+			}
+		}
+		if (!MapAddOns(AddOn.AddOns, Asset, Request, SeenClassMappings, SeenPropertyMappings,
+			ReplacedAddOnGuids, OutFindings))
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+bool FFlowNodeClassReplacement::PairEditorAddOns(
+	const UFlowNodeBase& Original,
+	UFlowNodeBase& Replacement,
+	UFlowNode& RootNode,
+	TArray<FString>& OutFindings)
+{
+	const TArray<UFlowNodeAddOn*>& Before = Original.GetFlowNodeAddOnChildren();
+	const TArray<UFlowNodeAddOn*>& After = Replacement.GetFlowNodeAddOnChildren();
+	if (Before.Num() != After.Num())
+	{
+		OutFindings.Add(TEXT("Addon count changed during replacement."));
+		return false;
+	}
+	for (int32 Index = 0; Index < Before.Num(); ++Index)
+	{
+		UFlowNodeAddOn* OldAddOn = Before[Index];
+		UFlowNodeAddOn* NewAddOn = After[Index];
+		UFlowGraphNode* EditorAddOn = IsValid(OldAddOn) ? Cast<UFlowGraphNode>(OldAddOn->GetGraphNode()) : nullptr;
+		if (!IsValid(NewAddOn) || !IsValid(EditorAddOn) || OldAddOn->GetGuid() != NewAddOn->GetGuid()
+			|| !EditorAddOn->IsA(UFlowGraphSchema::GetAssignedGraphNodeClass(NewAddOn->GetClass())))
+		{
+			OutFindings.Add(TEXT("An addon has no matching GUID or compatible editor node."));
+			return false;
+		}
+		EditorAddOn->Modify();
+		EditorAddOn->SetNodeTemplate(NewAddOn);
+		NewAddOn->SetGraphNode(EditorAddOn);
+		NewAddOn->SetFlowNodeForEditor(&RootNode);
+		if (!PairEditorAddOns(*OldAddOn, *NewAddOn, RootNode, OutFindings))
+		{
+			return false;
+		}
+	}
+	return true;
 }

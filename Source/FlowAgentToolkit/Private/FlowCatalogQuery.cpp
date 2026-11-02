@@ -259,216 +259,6 @@ namespace
 		EFlowCatalogSection::Deprecation;
 }
 
-bool UFlowCatalogQuery::ParseSections(const FString& SectionsString, EFlowCatalogSection& OutSections, bool& bOutDescriptionOnly, FString& OutError)
-{
-	OutSections = EFlowCatalogSection::None;
-	bOutDescriptionOnly = false;
-
-	if (SectionsString.TrimStartAndEnd().IsEmpty())
-	{
-		OutSections = EFlowCatalogSection::Shape;
-		return true;
-	}
-
-	TArray<FString> Tokens;
-	SectionsString.ParseIntoArray(Tokens, TEXT(","), /*bCullEmpty=*/true);
-
-	for (FString& Token : Tokens)
-	{
-		Token = Token.TrimStartAndEnd().ToLower();
-		if (Token.IsEmpty())
-		{
-			continue;
-		}
-
-		if (Token == TEXT("full"))
-		{
-			OutSections |= FlowCatalogSectionsFull;
-			continue;
-		}
-		if (Token == TEXT("brief"))
-		{
-			OutSections |= EFlowCatalogSection::Names | EFlowCatalogSection::Doc;
-			bOutDescriptionOnly = true;
-			continue;
-		}
-
-		const FFlowCatalogSectionName* Match = Algo::FindByPredicate(GFlowCatalogSectionNames,
-			[&Token](const FFlowCatalogSectionName& Candidate) { return Token == Candidate.Name; });
-
-		if (!Match)
-		{
-			OutError = FString::Printf(
-				TEXT("Unknown section \"%s\". Expected any of shape, names, doc, properties, pins, articles, usage, origin, deprecation, or a preset: shape, brief, full."),
-				*Token);
-			return false;
-		}
-
-		OutSections |= Match->Section;
-	}
-
-	if (OutSections == EFlowCatalogSection::None)
-	{
-		OutSections = EFlowCatalogSection::Shape;
-		return true;
-	}
-
-	// Every row-bearing section needs an identifier to hang off, so Names is implied rather than
-	// something the caller has to remember to ask for alongside everything else.
-	if (OutSections != EFlowCatalogSection::Shape)
-	{
-		OutSections |= EFlowCatalogSection::Names;
-	}
-
-	// A description-only doc is a request for less, so an explicit doc request alongside "brief" wins.
-	if (Tokens.Contains(TEXT("doc")) || Tokens.Contains(TEXT("full")))
-	{
-		bOutDescriptionOnly = false;
-	}
-
-	return true;
-}
-
-FString UFlowCatalogQuery::SectionsToString(EFlowCatalogSection Sections)
-{
-	TArray<FString> Names;
-	for (const FFlowCatalogSectionName& Candidate : GFlowCatalogSectionNames)
-	{
-		if (EnumHasAnyFlags(Sections, Candidate.Section))
-		{
-			Names.Add(Candidate.Name);
-		}
-	}
-	return FString::Join(Names, TEXT(","));
-}
-
-EFlowCatalogKind UFlowCatalogQuery::ParseKind(const FString& KindString)
-{
-	if (KindString.Equals(TEXT("node"), ESearchCase::IgnoreCase))
-	{
-		return EFlowCatalogKind::Node;
-	}
-	if (KindString.Equals(TEXT("addon"), ESearchCase::IgnoreCase))
-	{
-		return EFlowCatalogKind::Addon;
-	}
-	return EFlowCatalogKind::Any;
-}
-
-FString UFlowCatalogQuery::MakeClassStem(const FString& ClassName)
-{
-	FString Stem = ClassName;
-	Stem.RemoveFromEnd(TEXT("_C"));
-
-	// Strip one leading family prefix - the "MyNode_" in "MyNode_DoThing". Deliberately data-driven
-	// rather than a hardcoded prefix list, so a project's own naming families cost nothing to support.
-	int32 UnderscoreIndex = INDEX_NONE;
-	if (!Stem.FindChar(TEXT('_'), UnderscoreIndex) || UnderscoreIndex <= 0)
-	{
-		return Stem;
-	}
-
-	const FString Prefix = Stem.Left(UnderscoreIndex);
-	FString Remainder = Stem.RightChop(UnderscoreIndex + 1);
-	if (Remainder.IsEmpty())
-	{
-		return Stem;
-	}
-
-	// A doubled prefix ("MyNode_MyNode_DoThing") is a naming slip, not two families; drop both.
-	if (Remainder.StartsWith(Prefix + TEXT("_"), ESearchCase::CaseSensitive))
-	{
-		const FString Doubled = Remainder.RightChop(Prefix.Len() + 1);
-		if (!Doubled.IsEmpty())
-		{
-			Remainder = Doubled;
-		}
-	}
-
-	return Remainder;
-}
-
-void UFlowCatalogQuery::ResolveStems(TArray<FFlowCatalogClassRow>& Rows)
-{
-	// Precedence ladder, first rule that separates two rows wins. A lower score wins the bare stem.
-	auto ScoreRow = [](const FFlowCatalogClassRow& Row) -> int32
-	{
-		// 1. Deprecated always loses - an author should never be handed the retired name.
-		if (Row.bDeprecated)
-		{
-			return 100;
-		}
-
-		// 2. A class from the plugin that defines the Flow node hierarchy owns the plain name; a
-		//    domain class deliberately shadowing it is the one that qualifies itself.
-		if (const UClass* Class = FindObject<UClass>(nullptr, *Row.ClassPath))
-		{
-			static const TSharedPtr<IPlugin> CorePlugin = IPluginManager::Get().GetModuleOwnerPlugin(
-				FPackageName::GetShortFName(UFlowNode::StaticClass()->GetPackage()->GetName()));
-
-			const FName ModuleName = FPackageName::GetShortFName(Class->GetPackage()->GetName());
-			if (CorePlugin.IsValid() && IPluginManager::Get().GetModuleOwnerPlugin(ModuleName) == CorePlugin)
-			{
-				return 0;
-			}
-		}
-
-		// 3. Compiled code outranks script, which outranks content.
-		if (Row.Origin == EFlowClassOrigin::Blueprint)
-		{
-			return 30;
-		}
-		if (Row.Origin == EFlowClassOrigin::Native)
-		{
-			return 10;
-		}
-		return 20;
-	};
-
-	TMap<FString, TArray<int32>> StemToRowIndices;
-	for (int32 Index = 0; Index < Rows.Num(); ++Index)
-	{
-		Rows[Index].Stem = MakeClassStem(Rows[Index].ClassName);
-		StemToRowIndices.FindOrAdd(Rows[Index].Stem).Add(Index);
-	}
-
-	for (const TPair<FString, TArray<int32>>& Pair : StemToRowIndices)
-	{
-		if (Pair.Value.Num() < 2)
-		{
-			continue;
-		}
-
-		int32 BestIndex = INDEX_NONE;
-		int32 BestScore = MAX_int32;
-		bool bBestIsTied = false;
-		for (const int32 Index : Pair.Value)
-		{
-			const int32 Score = ScoreRow(Rows[Index]);
-			if (Score < BestScore)
-			{
-				BestScore = Score;
-				BestIndex = Index;
-				bBestIsTied = false;
-			}
-			else if (Score == BestScore)
-			{
-				bBestIsTied = true;
-			}
-		}
-
-		// An unbreakable tie means two implementations of one thing; neither may claim the stem, and
-		// the ambiguity is left visible rather than resolved by an arbitrary rule.
-		for (const int32 Index : Pair.Value)
-		{
-			if (bBestIsTied || Index != BestIndex)
-			{
-				Rows[Index].Stem = Rows[Index].ClassName;
-			}
-		}
-	}
-}
-
 FString LexToString(EFlowClassOrigin Origin)
 {
 	switch (Origin)
@@ -510,207 +300,6 @@ bool LexTryParseString(EFlowClassOrigin& OutOrigin, const FStringView Text)
 		return true;
 	}
 	return false;
-}
-
-EFlowClassOrigin UFlowCatalogQuery::GetClassOrigin(const UClass* NodeOrAddOnClass)
-{
-	if (!NodeOrAddOnClass)
-	{
-		return EFlowClassOrigin::Unknown;
-	}
-
-	if (NodeOrAddOnClass->ClassGeneratedBy != nullptr)
-	{
-		return EFlowClassOrigin::Blueprint;
-	}
-
-	// Detected by package rather than by class type: the AngelScript integration's UASClass lives in
-	// its own plugin, and this module must not take a dependency on it to answer a documentation query.
-	const UPackage* Package = NodeOrAddOnClass->GetPackage();
-	const FString PackageName = Package ? Package->GetName() : FString();
-	if (PackageName == TEXT("/Script/Angelscript"))
-	{
-		return EFlowClassOrigin::AngelScript;
-	}
-
-	// Only the header tool emits ModuleRelativePath, so its presence is a reliable "compiled from a
-	// .h/.cpp" marker that distinguishes native classes from any script VM's generated ones.
-	static const FName NAME_ModuleRelativePath(TEXT("ModuleRelativePath"));
-	if (NodeOrAddOnClass->HasMetaData(NAME_ModuleRelativePath))
-	{
-		return EFlowClassOrigin::Native;
-	}
-	return EFlowClassOrigin::Unknown;
-}
-
-bool UFlowCatalogQuery::IsClassDeprecated(const UClass* NodeOrAddOnClass)
-{
-#if WITH_EDITORONLY_DATA
-	if (const UFlowNodeBase* DefaultNode = NodeOrAddOnClass ? Cast<UFlowNodeBase>(NodeOrAddOnClass->GetDefaultObject()) : nullptr)
-	{
-		return DefaultNode->IsDeprecated();
-	}
-#endif
-	return false;
-}
-
-FString UFlowCatalogQuery::GetReplacedByClassName(const UClass* NodeOrAddOnClass)
-{
-#if WITH_EDITORONLY_DATA
-	if (const UFlowNodeBase* DefaultNode = NodeOrAddOnClass ? Cast<UFlowNodeBase>(NodeOrAddOnClass->GetDefaultObject()) : nullptr)
-	{
-		const FSoftObjectPath SuccessorPath = DefaultNode->GetReplacedByClass().ToSoftObjectPath();
-		if (!SuccessorPath.IsNull())
-		{
-			return SuccessorPath.GetAssetName();
-		}
-	}
-#endif
-	return FString();
-}
-
-void UFlowCatalogQuery::GatherAgentDoc(const UClass* NodeOrAddOnClass, FFlowCatalogDocRow& OutDoc, TArray<FString>& OutArticles)
-{
-	OutDoc = FFlowCatalogDocRow();
-	OutArticles.Reset();
-
-	const UFlowNodeBase* DefaultNode = NodeOrAddOnClass ? Cast<UFlowNodeBase>(NodeOrAddOnClass->GetDefaultObject()) : nullptr;
-	if (!DefaultNode)
-	{
-		return;
-	}
-
-	const FFlowAgentDoc& AgentDoc = DefaultNode->GetAgentDoc();
-	OutDoc.Guidance = AgentDoc.Guidance;
-
-	for (const FName& Tag : AgentDoc.Tags)
-	{
-		OutDoc.Tags.Add(Tag.ToString());
-	}
-
-	// UCLASS Keywords is the only searchable-term metadata an AngelScript or Blueprint class can set -
-	// neither can author a Tags array, which is C++-only (GetAgentDoc is a virtual override). Folding
-	// tokenized Keywords into Tags here, deduped, means an agent reading Doc.Tags sees every class's
-	// searchable terms in one place instead of native classes' terms being silently invisible once
-	// Keywords stops being its own reported field.
-	for (const FString& Keyword : SplitAndLowerKeywords(GetNodeKeywords(NodeOrAddOnClass)))
-	{
-		OutDoc.Tags.AddUnique(Keyword);
-	}
-
-	for (const FName& Article : AgentDoc.Articles)
-	{
-		OutArticles.Add(Article.ToString());
-	}
-}
-
-FFlowCatalogClassRow UFlowCatalogQuery::BuildRow(const UClass* Class, bool bIsAddon, const FFlowCatalogQueryParams& Params)
-{
-	FFlowCatalogClassRow Row;
-	if (!Class)
-	{
-		return Row;
-	}
-
-	// Identity is never optional: a row without its authoritative class path cannot be acted on.
-	Row.ClassName = Class->GetName();
-	Row.ClassPath = Class->GetPathName();
-	Row.bIsAddon = bIsAddon;
-	Row.Category = GetNodeCategory(Class);
-	Row.Origin = GetClassOrigin(Class);
-	Row.bDeprecated = IsClassDeprecated(Class);
-
-	if (EnumHasAnyFlags(Params.Sections, EFlowCatalogSection::Doc))
-	{
-		Row.Description = GetNodeDescription(Class);
-
-		if (Params.bDescriptionOnly)
-		{
-			// The "brief" preset carries only Description; avoid gathering the authored doc.
-			Row.Doc = FFlowCatalogDocRow();
-		}
-		else
-		{
-			TArray<FString> DocArticles;
-			GatherAgentDoc(Class, Row.Doc, DocArticles);
-		}
-	}
-
-	if (EnumHasAnyFlags(Params.Sections, EFlowCatalogSection::Articles))
-	{
-		FFlowCatalogDocRow UnusedDoc;
-		GatherAgentDoc(Class, UnusedDoc, Row.Articles);
-	}
-
-	if (EnumHasAnyFlags(Params.Sections, EFlowCatalogSection::Properties))
-	{
-		GatherProperties(Class, Row.Properties);
-	}
-
-	if (EnumHasAnyFlags(Params.Sections, EFlowCatalogSection::Pins))
-	{
-		GatherPins(Class, Row.InputPins, Row.OutputPins);
-	}
-
-	if (EnumHasAnyFlags(Params.Sections, EFlowCatalogSection::Deprecation))
-	{
-		Row.ReplacedBy = GetReplacedByClassName(Class);
-	}
-
-	if (EnumHasAnyFlags(Params.Sections, EFlowCatalogSection::Usage))
-	{
-		const FFlowNodeUsageSummary Usage = FFlowNodeUsageIndex::Get().GetUsageSummary(Row.ClassPath);
-		Row.UsageCount = Usage.InstanceCount;
-		Row.UsageAssetCount = Usage.AssetCount;
-	}
-
-	return Row;
-}
-
-void UFlowCatalogQuery::ListAssetTypes(TArray<FFlowCatalogAssetTypeRow>& OutAssetTypes)
-{
-	OutAssetTypes.Reset();
-
-	TArray<UClass*> NodeClasses;
-	GatherAllNodeClasses(NodeClasses);
-
-	TArray<UClass*> AddOnClasses;
-	GatherAllAddOnClasses(AddOnClasses);
-
-	TArray<UClass*> AssetClasses;
-	GatherAllFlowAssetClasses(AssetClasses);
-
-	for (const UClass* AssetClass : AssetClasses)
-	{
-		const UFlowAsset* AssetCDO = AssetClass->GetDefaultObject<UFlowAsset>();
-		if (!AssetCDO)
-		{
-			continue;
-		}
-
-		FFlowCatalogAssetTypeRow Row;
-		Row.ClassName = AssetClass->GetName();
-		Row.ClassPath = AssetClass->GetPathName();
-		Row.Description = AssetClass->GetToolTipText().ToString();
-		Row.Keywords = GetNodeKeywords(AssetClass);
-
-		for (const UClass* NodeClass : NodeClasses)
-		{
-			if (AssetCDO->IsNodeOrAddOnClassAllowed(NodeClass))
-			{
-				++Row.AllowedNodeCount;
-			}
-		}
-		for (const UClass* AddOnClass : AddOnClasses)
-		{
-			if (AssetCDO->IsNodeOrAddOnClassAllowed(AddOnClass))
-			{
-				++Row.AllowedAddonCount;
-			}
-		}
-
-		OutAssetTypes.Add(Row);
-	}
 }
 
 void UFlowCatalogQuery::QueryCatalog(const FFlowCatalogQueryParams& Params, FFlowCatalogQueryResult& OutResult)
@@ -996,6 +585,52 @@ void UFlowCatalogQuery::QueryCatalog(const FFlowCatalogQueryParams& Params, FFlo
 
 	OutResult.Nodes = MoveTemp(NodeRows);
 	OutResult.Addons = MoveTemp(AddonRows);
+}
+
+void UFlowCatalogQuery::ListAssetTypes(TArray<FFlowCatalogAssetTypeRow>& OutAssetTypes)
+{
+	OutAssetTypes.Reset();
+
+	TArray<UClass*> NodeClasses;
+	GatherAllNodeClasses(NodeClasses);
+
+	TArray<UClass*> AddOnClasses;
+	GatherAllAddOnClasses(AddOnClasses);
+
+	TArray<UClass*> AssetClasses;
+	GatherAllFlowAssetClasses(AssetClasses);
+
+	for (const UClass* AssetClass : AssetClasses)
+	{
+		const UFlowAsset* AssetCDO = AssetClass->GetDefaultObject<UFlowAsset>();
+		if (!AssetCDO)
+		{
+			continue;
+		}
+
+		FFlowCatalogAssetTypeRow Row;
+		Row.ClassName = AssetClass->GetName();
+		Row.ClassPath = AssetClass->GetPathName();
+		Row.Description = AssetClass->GetToolTipText().ToString();
+		Row.Keywords = GetNodeKeywords(AssetClass);
+
+		for (const UClass* NodeClass : NodeClasses)
+		{
+			if (AssetCDO->IsNodeOrAddOnClassAllowed(NodeClass))
+			{
+				++Row.AllowedNodeCount;
+			}
+		}
+		for (const UClass* AddOnClass : AddOnClasses)
+		{
+			if (AssetCDO->IsNodeOrAddOnClassAllowed(AddOnClass))
+			{
+				++Row.AllowedAddonCount;
+			}
+		}
+
+		OutAssetTypes.Add(Row);
+	}
 }
 
 namespace
@@ -1309,6 +944,75 @@ void UFlowCatalogQuery::GatherAllNodeClasses(TArray<UClass*>& OutNodeClasses)
 	GatherBlueprintDerivedClasses(UFlowNodeBlueprint::StaticClass(), UFlowNode::StaticClass(), OutNodeClasses);
 }
 
+void UFlowCatalogQuery::GatherAllAddOnClasses(TArray<UClass*>& OutAddOnClasses)
+{
+	OutAddOnClasses.Reset();
+
+	// Native C++ addon classes
+	TArray<UClass*> NativeAddOns;
+	GetDerivedClasses(UFlowNodeAddOn::StaticClass(), NativeAddOns);
+
+	for (UClass* Class : NativeAddOns)
+	{
+		if (Class->ClassGeneratedBy != nullptr)
+		{
+			continue;
+		}
+
+		if (Class->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists) ||
+			Class->HasMetaData(TEXT("ExcludeFromFlowCatalog")))
+		{
+			continue;
+		}
+
+		if (Class->GetName().StartsWith(TEXT("SKEL_")) ||
+			Class->GetName().StartsWith(TEXT("REINST_")) ||
+			Class->GetName().StartsWith(TEXT("TRASHCLASS_")))
+		{
+			continue;
+		}
+
+		OutAddOnClasses.Add(Class);
+	}
+
+	GatherBlueprintDerivedClasses(UFlowNodeAddOnBlueprint::StaticClass(), UFlowNodeAddOn::StaticClass(), OutAddOnClasses);
+}
+
+void UFlowCatalogQuery::GatherAllFlowAssetClasses(TArray<UClass*>& OutAssetClasses)
+{
+	OutAssetClasses.Reset();
+
+	TArray<UClass*> Derived;
+	GetDerivedClasses(UFlowAsset::StaticClass(), Derived, /*bRecursive=*/true);
+
+	for (UClass* Class : Derived)
+	{
+		if (Class->ClassGeneratedBy != nullptr)
+		{
+			continue;
+		}
+
+		if (Class->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
+		{
+			continue;
+		}
+
+		if (Class->GetName().StartsWith(TEXT("SKEL_")) ||
+			Class->GetName().StartsWith(TEXT("REINST_")) ||
+			Class->GetName().StartsWith(TEXT("TRASHCLASS_")))
+		{
+			continue;
+		}
+
+		OutAssetClasses.Add(Class);
+	}
+
+	OutAssetClasses.Sort([](const UClass& A, const UClass& B)
+	{
+		return A.GetName() < B.GetName();
+	});
+}
+
 UClass* UFlowCatalogQuery::FindFlowNodeOrAddOnClassByName(const FString& ClassName)
 {
 	if (ClassName.Contains(TEXT("/Script/")) || ClassName.Contains(TEXT(".")))
@@ -1391,6 +1095,131 @@ FString UFlowCatalogQuery::GetNodeCategory(const UClass* NodeOrAddOnClass)
 	}
 	
 	return FString();
+}
+
+EFlowClassOrigin UFlowCatalogQuery::GetClassOrigin(const UClass* NodeOrAddOnClass)
+{
+	if (!NodeOrAddOnClass)
+	{
+		return EFlowClassOrigin::Unknown;
+	}
+
+	if (NodeOrAddOnClass->ClassGeneratedBy != nullptr)
+	{
+		return EFlowClassOrigin::Blueprint;
+	}
+
+	// Detected by package rather than by class type: the AngelScript integration's UASClass lives in
+	// its own plugin, and this module must not take a dependency on it to answer a documentation query.
+	const UPackage* Package = NodeOrAddOnClass->GetPackage();
+	const FString PackageName = Package ? Package->GetName() : FString();
+	if (PackageName == TEXT("/Script/Angelscript"))
+	{
+		return EFlowClassOrigin::AngelScript;
+	}
+
+	// Only the header tool emits ModuleRelativePath, so its presence is a reliable "compiled from a
+	// .h/.cpp" marker that distinguishes native classes from any script VM's generated ones.
+	static const FName NAME_ModuleRelativePath(TEXT("ModuleRelativePath"));
+	if (NodeOrAddOnClass->HasMetaData(NAME_ModuleRelativePath))
+	{
+		return EFlowClassOrigin::Native;
+	}
+	return EFlowClassOrigin::Unknown;
+}
+
+bool UFlowCatalogQuery::IsClassDeprecated(const UClass* NodeOrAddOnClass)
+{
+#if WITH_EDITORONLY_DATA
+	if (const UFlowNodeBase* DefaultNode = NodeOrAddOnClass ? Cast<UFlowNodeBase>(NodeOrAddOnClass->GetDefaultObject()) : nullptr)
+	{
+		return DefaultNode->IsDeprecated();
+	}
+#endif
+	return false;
+}
+
+FString UFlowCatalogQuery::GetReplacedByClassName(const UClass* NodeOrAddOnClass)
+{
+#if WITH_EDITORONLY_DATA
+	if (const UFlowNodeBase* DefaultNode = NodeOrAddOnClass ? Cast<UFlowNodeBase>(NodeOrAddOnClass->GetDefaultObject()) : nullptr)
+	{
+		const FSoftObjectPath SuccessorPath = DefaultNode->GetReplacedByClass().ToSoftObjectPath();
+		if (!SuccessorPath.IsNull())
+		{
+			return SuccessorPath.GetAssetName();
+		}
+	}
+#endif
+	return FString();
+}
+
+void UFlowCatalogQuery::GatherAgentDoc(const UClass* NodeOrAddOnClass, FFlowCatalogDocRow& OutDoc, TArray<FString>& OutArticles)
+{
+	OutDoc = FFlowCatalogDocRow();
+	OutArticles.Reset();
+
+	const UFlowNodeBase* DefaultNode = NodeOrAddOnClass ? Cast<UFlowNodeBase>(NodeOrAddOnClass->GetDefaultObject()) : nullptr;
+	if (!DefaultNode)
+	{
+		return;
+	}
+
+	const FFlowAgentDoc& AgentDoc = DefaultNode->GetAgentDoc();
+	OutDoc.Guidance = AgentDoc.Guidance;
+
+	for (const FName& Tag : AgentDoc.Tags)
+	{
+		OutDoc.Tags.Add(Tag.ToString());
+	}
+
+	// UCLASS Keywords is the only searchable-term metadata an AngelScript or Blueprint class can set -
+	// neither can author a Tags array, which is C++-only (GetAgentDoc is a virtual override). Folding
+	// tokenized Keywords into Tags here, deduped, means an agent reading Doc.Tags sees every class's
+	// searchable terms in one place instead of native classes' terms being silently invisible once
+	// Keywords stops being its own reported field.
+	for (const FString& Keyword : SplitAndLowerKeywords(GetNodeKeywords(NodeOrAddOnClass)))
+	{
+		OutDoc.Tags.AddUnique(Keyword);
+	}
+
+	for (const FName& Article : AgentDoc.Articles)
+	{
+		OutArticles.Add(Article.ToString());
+	}
+}
+
+FString UFlowCatalogQuery::MakeClassStem(const FString& ClassName)
+{
+	FString Stem = ClassName;
+	Stem.RemoveFromEnd(TEXT("_C"));
+
+	// Strip one leading family prefix - the "MyNode_" in "MyNode_DoThing". Deliberately data-driven
+	// rather than a hardcoded prefix list, so a project's own naming families cost nothing to support.
+	int32 UnderscoreIndex = INDEX_NONE;
+	if (!Stem.FindChar(TEXT('_'), UnderscoreIndex) || UnderscoreIndex <= 0)
+	{
+		return Stem;
+	}
+
+	const FString Prefix = Stem.Left(UnderscoreIndex);
+	FString Remainder = Stem.RightChop(UnderscoreIndex + 1);
+	if (Remainder.IsEmpty())
+	{
+		return Stem;
+	}
+
+	// A doubled prefix ("MyNode_MyNode_DoThing") is a naming slip, not two families; drop both.
+	if (Remainder.StartsWith(Prefix + TEXT("_"), ESearchCase::CaseSensitive))
+	{
+		const FString Doubled = Remainder.RightChop(Prefix.Len() + 1);
+		if (!Doubled.IsEmpty())
+		{
+			Remainder = Doubled;
+		}
+	}
+
+	return Remainder;
 }
 
 namespace
@@ -1492,201 +1321,6 @@ namespace
 		Row.DeclaringClass = DeclaringClassName;
 		Row.Value = UFlowCatalogQuery::GetPropertyValueString(Property, ContainerPtr);
 	}
-}
-
-FString UFlowCatalogQuery::GetPropertyValueString(const FProperty* Property, const void* ContainerPtr)
-{
-	if (!Property || !ContainerPtr)
-	{
-		return TEXT("");
-	}
-
-	// Opaque (non-flattened) struct types get no terse value - stringifying an arbitrary struct isn't
-	// well-defined, and ShowOnlyInnerProperties structs never reach here (their fields are flattened
-	// into their own rows before GetPropertyValueString is called).
-	if (CastField<FStructProperty>(Property))
-	{
-		return TEXT("");
-	}
-
-	if (const FBoolProperty* BoolProp = CastField<FBoolProperty>(Property))
-	{
-		return BoolProp->GetPropertyValue_InContainer(ContainerPtr) ? TEXT("true") : TEXT("false");
-	}
-
-	if (const FArrayProperty* ArrayProp = CastField<FArrayProperty>(Property))
-	{
-		FScriptArrayHelper Helper(ArrayProp, ArrayProp->ContainerPtrToValuePtr<void>(ContainerPtr));
-		return FString::Printf(TEXT("%d elements"), Helper.Num());
-	}
-
-	if (const FObjectPropertyBase* ObjectProp = CastField<FObjectPropertyBase>(Property))
-	{
-		UObject* Value = ObjectProp->GetObjectPropertyValue_InContainer(ContainerPtr);
-		return Value ? Value->GetName() : TEXT("None");
-	}
-
-	// Bare enum value name regardless of what qualified form GetNameStringByValue returns (e.g.
-	// "EMyEnum::MyValue" or "MyValue") - the type is already reported separately in Row.Type, so
-	// repeating it here would be redundant.
-	auto GetBareEnumValueName = [](const UEnum* Enum, int64 Value) -> FString
-	{
-		const FString FullName = Enum->GetNameStringByValue(Value);
-		int32 LastColon;
-		return FullName.FindLastChar(':', LastColon) ? FullName.Mid(LastColon + 1) : FullName;
-	};
-
-	if (const FByteProperty* ByteProp = CastField<FByteProperty>(Property))
-	{
-		if (const UEnum* Enum = ByteProp->Enum)
-		{
-			return GetBareEnumValueName(Enum, ByteProp->GetPropertyValue_InContainer(ContainerPtr));
-		}
-	}
-
-	if (const FEnumProperty* EnumProp = CastField<FEnumProperty>(Property))
-	{
-		if (const UEnum* Enum = EnumProp->GetEnum())
-		{
-			const FNumericProperty* UnderlyingProp = EnumProp->GetUnderlyingProperty();
-			const int64 Value = UnderlyingProp->GetSignedIntPropertyValue(EnumProp->ContainerPtrToValuePtr<void>(ContainerPtr));
-			return GetBareEnumValueName(Enum, Value);
-		}
-	}
-
-	if (const FNumericProperty* NumericProp = CastField<FNumericProperty>(Property))
-	{
-		const void* ValuePtr = NumericProp->ContainerPtrToValuePtr<void>(ContainerPtr);
-		return NumericProp->IsFloatingPoint()
-			? FString::SanitizeFloat(NumericProp->GetFloatingPointPropertyValue(ValuePtr))
-			: LexToString(NumericProp->GetSignedIntPropertyValue(ValuePtr));
-	}
-
-	if (const FStrProperty* StrProp = CastField<FStrProperty>(Property))
-	{
-		return StrProp->GetPropertyValue_InContainer(ContainerPtr);
-	}
-
-	if (const FNameProperty* NameProp = CastField<FNameProperty>(Property))
-	{
-		return NameProp->GetPropertyValue_InContainer(ContainerPtr).ToString();
-	}
-
-	if (const FTextProperty* TextProp = CastField<FTextProperty>(Property))
-	{
-		return TextProp->GetPropertyValue_InContainer(ContainerPtr).ToString();
-	}
-
-	return TEXT("");
-}
-
-void UFlowCatalogQuery::GatherProperties(const UClass* NodeOrAddOnClass, TArray<FFlowCatalogPropertyRow>& OutRows)
-{
-	OutRows.Reset();
-
-	if (!NodeOrAddOnClass)
-	{
-		return;
-	}
-
-	const void* ContainerPtr = NodeOrAddOnClass->GetDefaultObject();
-
-	// TFieldIterator<FProperty> already walks the full ancestor chain, visiting the leaf class's own
-	// fields before its superclass's - which is also the order a caller wants to display them in, so
-	// no re-sort by DeclaringClass is needed.
-	for (TFieldIterator<FProperty> PropIt(NodeOrAddOnClass); PropIt; ++PropIt)
-	{
-		const FProperty* Property = *PropIt;
-		if (!Property || !ShouldIncludeCatalogProperty(Property) || IsPureDataPinSourceProperty(Property))
-		{
-			continue;
-		}
-
-		const UClass* DeclaringClass = Property->GetOwnerClass();
-		const FString DeclaringClassName = DeclaringClass ? DeclaringClass->GetName() : NodeOrAddOnClass->GetName();
-
-		AppendCatalogPropertyRow(Property, ContainerPtr, DeclaringClassName, Property->GetName(), OutRows);
-	}
-}
-
-void UFlowCatalogQuery::GatherPins(const UClass* NodeOrAddOnClass, TArray<FFlowCatalogPinRow>& OutInputPins, TArray<FFlowCatalogPinRow>& OutOutputPins)
-{
-	OutInputPins.Reset();
-	OutOutputPins.Reset();
-
-	// Cast<>() on the untyped CDO rather than GetDefaultObject<T>(), which would assert for a class
-	// outside the expected hierarchy instead of reporting "no pins".
-	const UFlowNodeBase* DefaultNode = NodeOrAddOnClass ? Cast<UFlowNodeBase>(NodeOrAddOnClass->GetDefaultObject()) : nullptr;
-	if (!DefaultNode)
-	{
-		return;
-	}
-
-	// GetCatalogPins can run authored Blueprint or script logic on the CDO. This checks the *result* is
-	// plausible and names the culprit if not; it cannot make the *call* safe, so every override on this
-	// path must be CDO-safe by construction - reading defaults, never dereferencing an owner.
-	TArray<FFlowPin> InputPins;
-	TArray<FFlowPin> OutputPins;
-	{
-		UE_LOG(LogFlow, VeryVerbose, TEXT("FlowCatalogQuery: enumerating catalog pins for %s"), *NodeOrAddOnClass->GetPathName());
-
-		DefaultNode->GetCatalogPins(InputPins, OutputPins);
-
-		if (!ensureMsgf(InputPins.Num() < 512 && OutputPins.Num() < 512,
-			TEXT("FlowCatalogQuery: %s reported an implausible pin count (%d in / %d out) from GetCatalogPins; ignoring its pins."),
-			*NodeOrAddOnClass->GetPathName(), InputPins.Num(), OutputPins.Num()))
-		{
-			return;
-		}
-	}
-
-	auto AppendPins = [](const TArray<FFlowPin>& Pins, TArray<FFlowCatalogPinRow>& OutRows)
-	{
-		for (const FFlowPin& Pin : Pins)
-		{
-			FFlowCatalogPinRow& Row = OutRows.AddDefaulted_GetRef();
-			Row.Name = Pin.PinName.ToString();
-			Row.Type = GetPinTypeName(Pin);
-			Row.Description = Pin.PinToolTip;
-		}
-	};
-	AppendPins(InputPins, OutInputPins);
-	AppendPins(OutputPins, OutOutputPins);
-
-	// Auto-generated data pins never appear in GetCatalogPins - that only covers the user-declared
-	// exec pin arrays - so fold them in here from the full ancestor chain's properties. They're real
-	// graph pins on the node just like the exec pins above, so callers shouldn't have to separately
-	// cross-reference a property's PinBinding to know a data pin exists.
-	for (TFieldIterator<FProperty> PropIt(NodeOrAddOnClass); PropIt; ++PropIt)
-	{
-		const FProperty* Property = *PropIt;
-		if (!Property)
-		{
-			continue;
-		}
-
-		if (Property->HasMetaData(FFlowPin::MetadataKey_SourceForOutputFlowPin))
-		{
-			FFlowCatalogPinRow& Row = OutOutputPins.AddDefaulted_GetRef();
-			Row.Name = GetAutoDataPinName(Property, FFlowPin::MetadataKey_SourceForOutputFlowPin);
-			Row.Type = Property->GetMetaData(FFlowPin::MetadataKey_FlowPinType);
-			Row.Description = Property->GetToolTipText().ToString();
-		}
-		else if (Property->HasMetaData(FFlowPin::MetadataKey_DefaultForInputFlowPin))
-		{
-			FFlowCatalogPinRow& Row = OutInputPins.AddDefaulted_GetRef();
-			Row.Name = GetAutoDataPinName(Property, FFlowPin::MetadataKey_DefaultForInputFlowPin);
-			Row.Type = Property->GetMetaData(FFlowPin::MetadataKey_FlowPinType);
-			Row.Description = Property->GetToolTipText().ToString();
-		}
-	}
-
-	// Deliberately NOT queried here: IFlowContextPinSupplierInterface. A context pin is derived from
-	// the instance's live context - FlowNodeAddOn_SwitchCase reads its owning FlowNode to build one -
-	// and a class default object has no owner, so the question is meaningless to ask of one. It is also
-	// unguardable: those implementations assert on the missing owner, and an ensure is a debug break
-	// rather than something a caller can catch or flag its way past. Pins that only exist on a real
-	// instance are reported by FindFlowNodeUsage, which reads shipped assets.
 }
 
 FString UFlowCatalogQuery::GetPropertyTypeName(const FProperty* Property)
@@ -1874,6 +1508,92 @@ FString UFlowCatalogQuery::GetPropertyPinBinding(const FProperty* Property)
 	return TEXT("-");
 }
 
+FString UFlowCatalogQuery::GetPropertyValueString(const FProperty* Property, const void* ContainerPtr)
+{
+	if (!Property || !ContainerPtr)
+	{
+		return TEXT("");
+	}
+
+	// Opaque (non-flattened) struct types get no terse value - stringifying an arbitrary struct isn't
+	// well-defined, and ShowOnlyInnerProperties structs never reach here (their fields are flattened
+	// into their own rows before GetPropertyValueString is called).
+	if (CastField<FStructProperty>(Property))
+	{
+		return TEXT("");
+	}
+
+	if (const FBoolProperty* BoolProp = CastField<FBoolProperty>(Property))
+	{
+		return BoolProp->GetPropertyValue_InContainer(ContainerPtr) ? TEXT("true") : TEXT("false");
+	}
+
+	if (const FArrayProperty* ArrayProp = CastField<FArrayProperty>(Property))
+	{
+		FScriptArrayHelper Helper(ArrayProp, ArrayProp->ContainerPtrToValuePtr<void>(ContainerPtr));
+		return FString::Printf(TEXT("%d elements"), Helper.Num());
+	}
+
+	if (const FObjectPropertyBase* ObjectProp = CastField<FObjectPropertyBase>(Property))
+	{
+		UObject* Value = ObjectProp->GetObjectPropertyValue_InContainer(ContainerPtr);
+		return Value ? Value->GetName() : TEXT("None");
+	}
+
+	// Bare enum value name regardless of what qualified form GetNameStringByValue returns (e.g.
+	// "EMyEnum::MyValue" or "MyValue") - the type is already reported separately in Row.Type, so
+	// repeating it here would be redundant.
+	auto GetBareEnumValueName = [](const UEnum* Enum, int64 Value) -> FString
+	{
+		const FString FullName = Enum->GetNameStringByValue(Value);
+		int32 LastColon;
+		return FullName.FindLastChar(':', LastColon) ? FullName.Mid(LastColon + 1) : FullName;
+	};
+
+	if (const FByteProperty* ByteProp = CastField<FByteProperty>(Property))
+	{
+		if (const UEnum* Enum = ByteProp->Enum)
+		{
+			return GetBareEnumValueName(Enum, ByteProp->GetPropertyValue_InContainer(ContainerPtr));
+		}
+	}
+
+	if (const FEnumProperty* EnumProp = CastField<FEnumProperty>(Property))
+	{
+		if (const UEnum* Enum = EnumProp->GetEnum())
+		{
+			const FNumericProperty* UnderlyingProp = EnumProp->GetUnderlyingProperty();
+			const int64 Value = UnderlyingProp->GetSignedIntPropertyValue(EnumProp->ContainerPtrToValuePtr<void>(ContainerPtr));
+			return GetBareEnumValueName(Enum, Value);
+		}
+	}
+
+	if (const FNumericProperty* NumericProp = CastField<FNumericProperty>(Property))
+	{
+		const void* ValuePtr = NumericProp->ContainerPtrToValuePtr<void>(ContainerPtr);
+		return NumericProp->IsFloatingPoint()
+			? FString::SanitizeFloat(NumericProp->GetFloatingPointPropertyValue(ValuePtr))
+			: LexToString(NumericProp->GetSignedIntPropertyValue(ValuePtr));
+	}
+
+	if (const FStrProperty* StrProp = CastField<FStrProperty>(Property))
+	{
+		return StrProp->GetPropertyValue_InContainer(ContainerPtr);
+	}
+
+	if (const FNameProperty* NameProp = CastField<FNameProperty>(Property))
+	{
+		return NameProp->GetPropertyValue_InContainer(ContainerPtr).ToString();
+	}
+
+	if (const FTextProperty* TextProp = CastField<FTextProperty>(Property))
+	{
+		return TextProp->GetPropertyValue_InContainer(ContainerPtr).ToString();
+	}
+
+	return TEXT("");
+}
+
 FString UFlowCatalogQuery::GetPinTypeName(const FFlowPin& Pin)
 {
 	const FFlowPinTypeName& PinTypeName = Pin.GetPinTypeName();
@@ -1917,45 +1637,6 @@ bool UFlowCatalogQuery::CanNodeAddUserOutputPins(const UClass* NodeClass)
 	}
 	
 	return false;
-}
-
-void UFlowCatalogQuery::GatherAllAddOnClasses(TArray<UClass*>& OutAddOnClasses)
-{
-	OutAddOnClasses.Reset();
-
-	// Native C++ addon classes
-	TArray<UClass*> NativeAddOns;
-	GetDerivedClasses(UFlowNodeAddOn::StaticClass(), NativeAddOns);
-
-	for (UClass* Class : NativeAddOns)
-	{
-		if (Class->ClassGeneratedBy != nullptr)
-		{
-			continue;
-		}
-
-		if (Class->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists) ||
-			Class->HasMetaData(TEXT("ExcludeFromFlowCatalog")))
-		{
-			continue;
-		}
-
-		if (Class->GetName().StartsWith(TEXT("SKEL_")) ||
-			Class->GetName().StartsWith(TEXT("REINST_")) ||
-			Class->GetName().StartsWith(TEXT("TRASHCLASS_")))
-		{
-			continue;
-		}
-
-		OutAddOnClasses.Add(Class);
-	}
-
-	GatherBlueprintDerivedClasses(UFlowNodeAddOnBlueprint::StaticClass(), UFlowNodeAddOn::StaticClass(), OutAddOnClasses);
-}
-
-FString UFlowCatalogQuery::GetNodeKeywords(const UClass* NodeClass)
-{
-	return UFlowNodeBase::GetInheritedNodeKeywords(NodeClass);
 }
 
 void UFlowCatalogQuery::GatherAllKeywords(
@@ -2015,41 +1696,6 @@ void UFlowCatalogQuery::GatherAllKeywords(
 	}
 }
 
-void UFlowCatalogQuery::GatherAllFlowAssetClasses(TArray<UClass*>& OutAssetClasses)
-{
-	OutAssetClasses.Reset();
-
-	TArray<UClass*> Derived;
-	GetDerivedClasses(UFlowAsset::StaticClass(), Derived, /*bRecursive=*/true);
-
-	for (UClass* Class : Derived)
-	{
-		if (Class->ClassGeneratedBy != nullptr)
-		{
-			continue;
-		}
-
-		if (Class->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
-		{
-			continue;
-		}
-
-		if (Class->GetName().StartsWith(TEXT("SKEL_")) ||
-			Class->GetName().StartsWith(TEXT("REINST_")) ||
-			Class->GetName().StartsWith(TEXT("TRASHCLASS_")))
-		{
-			continue;
-		}
-
-		OutAssetClasses.Add(Class);
-	}
-
-	OutAssetClasses.Sort([](const UClass& A, const UClass& B)
-	{
-		return A.GetName() < B.GetName();
-	});
-}
-
 bool UFlowCatalogQuery::ClassHasPinOfAnyType(const UClass* NodeOrAddOnClass, const TArray<FString>& PinTypeFilter)
 {
 	if (PinTypeFilter.IsEmpty())
@@ -2077,5 +1723,359 @@ bool UFlowCatalogQuery::ClassHasPinOfAnyType(const UClass* NodeOrAddOnClass, con
 	}
 
 	return false;
+}
+
+void UFlowCatalogQuery::GatherPins(const UClass* NodeOrAddOnClass, TArray<FFlowCatalogPinRow>& OutInputPins, TArray<FFlowCatalogPinRow>& OutOutputPins)
+{
+	OutInputPins.Reset();
+	OutOutputPins.Reset();
+
+	// Cast<>() on the untyped CDO rather than GetDefaultObject<T>(), which would assert for a class
+	// outside the expected hierarchy instead of reporting "no pins".
+	const UFlowNodeBase* DefaultNode = NodeOrAddOnClass ? Cast<UFlowNodeBase>(NodeOrAddOnClass->GetDefaultObject()) : nullptr;
+	if (!DefaultNode)
+	{
+		return;
+	}
+
+	// GetCatalogPins can run authored Blueprint or script logic on the CDO. This checks the *result* is
+	// plausible and names the culprit if not; it cannot make the *call* safe, so every override on this
+	// path must be CDO-safe by construction - reading defaults, never dereferencing an owner.
+	TArray<FFlowPin> InputPins;
+	TArray<FFlowPin> OutputPins;
+	{
+		UE_LOG(LogFlow, VeryVerbose, TEXT("FlowCatalogQuery: enumerating catalog pins for %s"), *NodeOrAddOnClass->GetPathName());
+
+		DefaultNode->GetCatalogPins(InputPins, OutputPins);
+
+		if (!ensureMsgf(InputPins.Num() < 512 && OutputPins.Num() < 512,
+			TEXT("FlowCatalogQuery: %s reported an implausible pin count (%d in / %d out) from GetCatalogPins; ignoring its pins."),
+			*NodeOrAddOnClass->GetPathName(), InputPins.Num(), OutputPins.Num()))
+		{
+			return;
+		}
+	}
+
+	auto AppendPins = [](const TArray<FFlowPin>& Pins, TArray<FFlowCatalogPinRow>& OutRows)
+	{
+		for (const FFlowPin& Pin : Pins)
+		{
+			FFlowCatalogPinRow& Row = OutRows.AddDefaulted_GetRef();
+			Row.Name = Pin.PinName.ToString();
+			Row.Type = GetPinTypeName(Pin);
+			Row.Description = Pin.PinToolTip;
+		}
+	};
+	AppendPins(InputPins, OutInputPins);
+	AppendPins(OutputPins, OutOutputPins);
+
+	// Auto-generated data pins never appear in GetCatalogPins - that only covers the user-declared
+	// exec pin arrays - so fold them in here from the full ancestor chain's properties. They're real
+	// graph pins on the node just like the exec pins above, so callers shouldn't have to separately
+	// cross-reference a property's PinBinding to know a data pin exists.
+	for (TFieldIterator<FProperty> PropIt(NodeOrAddOnClass); PropIt; ++PropIt)
+	{
+		const FProperty* Property = *PropIt;
+		if (!Property)
+		{
+			continue;
+		}
+
+		if (Property->HasMetaData(FFlowPin::MetadataKey_SourceForOutputFlowPin))
+		{
+			FFlowCatalogPinRow& Row = OutOutputPins.AddDefaulted_GetRef();
+			Row.Name = GetAutoDataPinName(Property, FFlowPin::MetadataKey_SourceForOutputFlowPin);
+			Row.Type = Property->GetMetaData(FFlowPin::MetadataKey_FlowPinType);
+			Row.Description = Property->GetToolTipText().ToString();
+		}
+		else if (Property->HasMetaData(FFlowPin::MetadataKey_DefaultForInputFlowPin))
+		{
+			FFlowCatalogPinRow& Row = OutInputPins.AddDefaulted_GetRef();
+			Row.Name = GetAutoDataPinName(Property, FFlowPin::MetadataKey_DefaultForInputFlowPin);
+			Row.Type = Property->GetMetaData(FFlowPin::MetadataKey_FlowPinType);
+			Row.Description = Property->GetToolTipText().ToString();
+		}
+	}
+
+	// Deliberately NOT queried here: IFlowContextPinSupplierInterface. A context pin is derived from
+	// the instance's live context - FlowNodeAddOn_SwitchCase reads its owning FlowNode to build one -
+	// and a class default object has no owner, so the question is meaningless to ask of one. It is also
+	// unguardable: those implementations assert on the missing owner, and an ensure is a debug break
+	// rather than something a caller can catch or flag its way past. Pins that only exist on a real
+	// instance are reported by FindFlowNodeUsage, which reads shipped assets.
+}
+
+void UFlowCatalogQuery::GatherProperties(const UClass* NodeOrAddOnClass, TArray<FFlowCatalogPropertyRow>& OutRows)
+{
+	OutRows.Reset();
+
+	if (!NodeOrAddOnClass)
+	{
+		return;
+	}
+
+	const void* ContainerPtr = NodeOrAddOnClass->GetDefaultObject();
+
+	// TFieldIterator<FProperty> already walks the full ancestor chain, visiting the leaf class's own
+	// fields before its superclass's - which is also the order a caller wants to display them in, so
+	// no re-sort by DeclaringClass is needed.
+	for (TFieldIterator<FProperty> PropIt(NodeOrAddOnClass); PropIt; ++PropIt)
+	{
+		const FProperty* Property = *PropIt;
+		if (!Property || !ShouldIncludeCatalogProperty(Property) || IsPureDataPinSourceProperty(Property))
+		{
+			continue;
+		}
+
+		const UClass* DeclaringClass = Property->GetOwnerClass();
+		const FString DeclaringClassName = DeclaringClass ? DeclaringClass->GetName() : NodeOrAddOnClass->GetName();
+
+		AppendCatalogPropertyRow(Property, ContainerPtr, DeclaringClassName, Property->GetName(), OutRows);
+	}
+}
+
+bool UFlowCatalogQuery::ParseSections(const FString& SectionsString, EFlowCatalogSection& OutSections, bool& bOutDescriptionOnly, FString& OutError)
+{
+	OutSections = EFlowCatalogSection::None;
+	bOutDescriptionOnly = false;
+
+	if (SectionsString.TrimStartAndEnd().IsEmpty())
+	{
+		OutSections = EFlowCatalogSection::Shape;
+		return true;
+	}
+
+	TArray<FString> Tokens;
+	SectionsString.ParseIntoArray(Tokens, TEXT(","), /*bCullEmpty=*/true);
+
+	for (FString& Token : Tokens)
+	{
+		Token = Token.TrimStartAndEnd().ToLower();
+		if (Token.IsEmpty())
+		{
+			continue;
+		}
+
+		if (Token == TEXT("full"))
+		{
+			OutSections |= FlowCatalogSectionsFull;
+			continue;
+		}
+		if (Token == TEXT("brief"))
+		{
+			OutSections |= EFlowCatalogSection::Names | EFlowCatalogSection::Doc;
+			bOutDescriptionOnly = true;
+			continue;
+		}
+
+		const FFlowCatalogSectionName* Match = Algo::FindByPredicate(GFlowCatalogSectionNames,
+			[&Token](const FFlowCatalogSectionName& Candidate) { return Token == Candidate.Name; });
+
+		if (!Match)
+		{
+			OutError = FString::Printf(
+				TEXT("Unknown section \"%s\". Expected any of shape, names, doc, properties, pins, articles, usage, origin, deprecation, or a preset: shape, brief, full."),
+				*Token);
+			return false;
+		}
+
+		OutSections |= Match->Section;
+	}
+
+	if (OutSections == EFlowCatalogSection::None)
+	{
+		OutSections = EFlowCatalogSection::Shape;
+		return true;
+	}
+
+	// Every row-bearing section needs an identifier to hang off, so Names is implied rather than
+	// something the caller has to remember to ask for alongside everything else.
+	if (OutSections != EFlowCatalogSection::Shape)
+	{
+		OutSections |= EFlowCatalogSection::Names;
+	}
+
+	// A description-only doc is a request for less, so an explicit doc request alongside "brief" wins.
+	if (Tokens.Contains(TEXT("doc")) || Tokens.Contains(TEXT("full")))
+	{
+		bOutDescriptionOnly = false;
+	}
+
+	return true;
+}
+
+FString UFlowCatalogQuery::SectionsToString(EFlowCatalogSection Sections)
+{
+	TArray<FString> Names;
+	for (const FFlowCatalogSectionName& Candidate : GFlowCatalogSectionNames)
+	{
+		if (EnumHasAnyFlags(Sections, Candidate.Section))
+		{
+			Names.Add(Candidate.Name);
+		}
+	}
+	return FString::Join(Names, TEXT(","));
+}
+
+EFlowCatalogKind UFlowCatalogQuery::ParseKind(const FString& KindString)
+{
+	if (KindString.Equals(TEXT("node"), ESearchCase::IgnoreCase))
+	{
+		return EFlowCatalogKind::Node;
+	}
+	if (KindString.Equals(TEXT("addon"), ESearchCase::IgnoreCase))
+	{
+		return EFlowCatalogKind::Addon;
+	}
+	return EFlowCatalogKind::Any;
+}
+
+FString UFlowCatalogQuery::GetNodeKeywords(const UClass* NodeClass)
+{
+	return UFlowNodeBase::GetInheritedNodeKeywords(NodeClass);
+}
+
+FFlowCatalogClassRow UFlowCatalogQuery::BuildRow(const UClass* Class, bool bIsAddon, const FFlowCatalogQueryParams& Params)
+{
+	FFlowCatalogClassRow Row;
+	if (!Class)
+	{
+		return Row;
+	}
+
+	// Identity is never optional: a row without its authoritative class path cannot be acted on.
+	Row.ClassName = Class->GetName();
+	Row.ClassPath = Class->GetPathName();
+	Row.bIsAddon = bIsAddon;
+	Row.Category = GetNodeCategory(Class);
+	Row.Origin = GetClassOrigin(Class);
+	Row.bDeprecated = IsClassDeprecated(Class);
+
+	if (EnumHasAnyFlags(Params.Sections, EFlowCatalogSection::Doc))
+	{
+		Row.Description = GetNodeDescription(Class);
+
+		if (Params.bDescriptionOnly)
+		{
+			// The "brief" preset carries only Description; avoid gathering the authored doc.
+			Row.Doc = FFlowCatalogDocRow();
+		}
+		else
+		{
+			TArray<FString> DocArticles;
+			GatherAgentDoc(Class, Row.Doc, DocArticles);
+		}
+	}
+
+	if (EnumHasAnyFlags(Params.Sections, EFlowCatalogSection::Articles))
+	{
+		FFlowCatalogDocRow UnusedDoc;
+		GatherAgentDoc(Class, UnusedDoc, Row.Articles);
+	}
+
+	if (EnumHasAnyFlags(Params.Sections, EFlowCatalogSection::Properties))
+	{
+		GatherProperties(Class, Row.Properties);
+	}
+
+	if (EnumHasAnyFlags(Params.Sections, EFlowCatalogSection::Pins))
+	{
+		GatherPins(Class, Row.InputPins, Row.OutputPins);
+	}
+
+	if (EnumHasAnyFlags(Params.Sections, EFlowCatalogSection::Deprecation))
+	{
+		Row.ReplacedBy = GetReplacedByClassName(Class);
+	}
+
+	if (EnumHasAnyFlags(Params.Sections, EFlowCatalogSection::Usage))
+	{
+		const FFlowNodeUsageSummary Usage = FFlowNodeUsageIndex::Get().GetUsageSummary(Row.ClassPath);
+		Row.UsageCount = Usage.InstanceCount;
+		Row.UsageAssetCount = Usage.AssetCount;
+	}
+
+	return Row;
+}
+
+void UFlowCatalogQuery::ResolveStems(TArray<FFlowCatalogClassRow>& Rows)
+{
+	// Precedence ladder, first rule that separates two rows wins. A lower score wins the bare stem.
+	auto ScoreRow = [](const FFlowCatalogClassRow& Row) -> int32
+	{
+		// 1. Deprecated always loses - an author should never be handed the retired name.
+		if (Row.bDeprecated)
+		{
+			return 100;
+		}
+
+		// 2. A class from the plugin that defines the Flow node hierarchy owns the plain name; a
+		//    domain class deliberately shadowing it is the one that qualifies itself.
+		if (const UClass* Class = FindObject<UClass>(nullptr, *Row.ClassPath))
+		{
+			static const TSharedPtr<IPlugin> CorePlugin = IPluginManager::Get().GetModuleOwnerPlugin(
+				FPackageName::GetShortFName(UFlowNode::StaticClass()->GetPackage()->GetName()));
+
+			const FName ModuleName = FPackageName::GetShortFName(Class->GetPackage()->GetName());
+			if (CorePlugin.IsValid() && IPluginManager::Get().GetModuleOwnerPlugin(ModuleName) == CorePlugin)
+			{
+				return 0;
+			}
+		}
+
+		// 3. Compiled code outranks script, which outranks content.
+		if (Row.Origin == EFlowClassOrigin::Blueprint)
+		{
+			return 30;
+		}
+		if (Row.Origin == EFlowClassOrigin::Native)
+		{
+			return 10;
+		}
+		return 20;
+	};
+
+	TMap<FString, TArray<int32>> StemToRowIndices;
+	for (int32 Index = 0; Index < Rows.Num(); ++Index)
+	{
+		Rows[Index].Stem = MakeClassStem(Rows[Index].ClassName);
+		StemToRowIndices.FindOrAdd(Rows[Index].Stem).Add(Index);
+	}
+
+	for (const TPair<FString, TArray<int32>>& Pair : StemToRowIndices)
+	{
+		if (Pair.Value.Num() < 2)
+		{
+			continue;
+		}
+
+		int32 BestIndex = INDEX_NONE;
+		int32 BestScore = MAX_int32;
+		bool bBestIsTied = false;
+		for (const int32 Index : Pair.Value)
+		{
+			const int32 Score = ScoreRow(Rows[Index]);
+			if (Score < BestScore)
+			{
+				BestScore = Score;
+				BestIndex = Index;
+				bBestIsTied = false;
+			}
+			else if (Score == BestScore)
+			{
+				bBestIsTied = true;
+			}
+		}
+
+		// An unbreakable tie means two implementations of one thing; neither may claim the stem, and
+		// the ambiguity is left visible rather than resolved by an arbitrary rule.
+		for (const int32 Index : Pair.Value)
+		{
+			if (bBestIsTied || Index != BestIndex)
+			{
+				Rows[Index].Stem = Rows[Index].ClassName;
+			}
+		}
+	}
 }
 

@@ -642,102 +642,6 @@ bool UFlowGraphRegrapher::RegraphFlowAsset(UFlowAsset* FlowAsset)
 	return RegraphFlowAsset(FlowAsset, NoPositions);
 }
 
-bool UFlowGraphRegrapher::RegraphFlowAsset(UFlowAsset* FlowAsset, const TMap<FGuid, FIntPoint>& NodePositions)
-{
-	static const TMap<FGuid, FString> NoComments;
-	return RegraphFlowAsset(FlowAsset, NodePositions, NoComments);
-}
-
-bool UFlowGraphRegrapher::RegraphFlowAsset(UFlowAsset* FlowAsset, const TMap<FGuid, FIntPoint>& NodePositions, const TMap<FGuid, FString>& NodeComments)
-{
-	if (!FlowAsset)
-	{
-		UE_LOG(LogFlow, Error, TEXT("UFlowGraphRegrapher::RegraphFlowAsset: FlowAsset is null"));
-		return false;
-	}
-	if (!GEditor)
-	{
-		UE_LOG(LogFlow, Error, TEXT("UFlowGraphRegrapher::RegraphFlowAsset: GEditor is not available"));
-		return false;
-	}
-	if (GEditor->IsPlaySessionInProgress())
-	{
-		UE_LOG(LogFlow, Error, TEXT("UFlowGraphRegrapher::RegraphFlowAsset: Cannot regraph during PIE"));
-		return false;
-	}
-	if (!FlowGraphRegrapherDetail::ValidateRuntimeGraphForRegraph(*FlowAsset))
-	{
-		return false;
-	}
-
-	FlowGraphRegrapherDetail::CacheFlowNodeOwnersForContextPins(*FlowAsset);
-	if (!FlowGraphRegrapherDetail::ValidateRuntimePinMetadata(*FlowAsset))
-	{
-		return false;
-	}
-	if (!FlowGraphRegrapherDetail::ValidateRuntimeConnectionsForRegraph(*FlowAsset))
-	{
-		return false;
-	}
-
-	// Ensure the FlowAsset has a UFlowGraph. If the asset already has real runtime nodes (e.g. from
-	// a FlowAgent import/reconcile), skip default node seeding - CreateDefaultNodesForGraph is only
-	// appropriate for a brand new, genuinely empty FlowAsset and would otherwise inject an unwanted
-	// extra Start node into the runtime Nodes map on this first regraph.
-	UFlowGraph* FlowGraph = Cast<UFlowGraph>(FlowAsset->GetGraph());
-	if (!FlowGraph)
-	{
-		const bool bCreateDefaultNodes = FlowAsset->GetNodes().IsEmpty();
-		UFlowGraph::CreateGraph(FlowAsset, UFlowGraphSchema::StaticClass(), bCreateDefaultNodes);
-		FlowGraph = Cast<UFlowGraph>(FlowAsset->GetGraph());
-		if (!FlowGraph)
-		{
-			UE_LOG(LogFlow, Error, TEXT("UFlowGraphRegrapher::RegraphFlowAsset: Failed to create editor graph for asset '%s'"),
-				*FlowAsset->GetPathName());
-			return false;
-		}
-	}
-
-	if (FlowGraph->IsLocked())
-	{
-		UE_LOG(LogFlow, Error, TEXT("UFlowGraphRegrapher::RegraphFlowAsset: Editor graph is already locked for asset '%s'"),
-			*FlowAsset->GetPathName());
-		return false;
-	}
-	FlowGraph->LockUpdates();
-
-	// Before anything is wired: drop editor nodes whose runtime node is gone. Their pin links are
-	// still live, and CreateEditorPinConnections' HarvestNodeConnections would otherwise harvest
-	// them straight back into the runtime Connections map, resurrecting connections to a node that
-	// no longer exists.
-	PruneOrphanedEditorNodes(FlowAsset);
-	if (!FlowGraphRegrapherDetail::ReconcileTopLevelEditorNodes(*FlowAsset, *FlowGraph, NodePositions, NodeComments))
-	{
-		return FlowGraphRegrapherDetail::AbortLockedRegraph(*FlowGraph);
-	}
-	TSet<UFlowGraphNode*> ParentNodesToReconstruct;
-	if (!FlowGraphRegrapherDetail::ReconcileEditorAddOnTrees(*FlowAsset, *FlowGraph, ParentNodesToReconstruct))
-	{
-		return FlowGraphRegrapherDetail::AbortLockedRegraph(*FlowGraph);
-	}
-	if (!FlowGraphRegrapherDetail::CreateRequiredEditorPins(*FlowAsset))
-	{
-		return FlowGraphRegrapherDetail::AbortLockedRegraph(*FlowGraph);
-	}
-	if (!FlowGraphRegrapherDetail::ReconcileEditorPinConnections(*FlowAsset, *FlowGraph))
-	{
-		return FlowGraphRegrapherDetail::AbortLockedRegraph(*FlowGraph);
-	}
-
-	FlowGraph->UnlockUpdatesWithoutReconcile();
-	// ReconcileEditorAddOnTrees changes the context pins supplied by AddOns, but the owning nodes'
-	// pin arrays can still reflect their previous AddOns. Reconstruct after unlocking so runtime and
-	// editor pins agree before NotifyGraphChanged harvests their connections.
-	FlowGraphRegrapherDetail::FinalizeParentNodePins(ParentNodesToReconstruct);
-	FlowGraph->NotifyGraphChanged();
-	return true;
-}
-
 namespace FlowGraphRegrapherDetail
 {
 	// Returns the top-level editor node representing RuntimeGuid, or null. Only nodes standing in
@@ -781,83 +685,6 @@ namespace FlowGraphRegrapherDetail
 		BreakNodeLinksWithoutNotification(FlowGraphNode);
 		FlowGraphNode.DestroyNode();
 	}
-}
-
-bool UFlowGraphRegrapher::DestroyEditorNodeForRuntimeNode(UFlowAsset* FlowAsset, const FGuid& NodeGuid)
-{
-	UFlowGraph* FlowGraph = FlowAsset ? Cast<UFlowGraph>(FlowAsset->GetGraph()) : nullptr;
-	if (!FlowGraph)
-	{
-		// An asset built purely programmatically may never have had an editor graph; there is no
-		// editor node to destroy and nothing is wrong.
-		return false;
-	}
-
-	UFlowGraphNode* FlowGraphNode = FlowGraphRegrapherDetail::FindTopLevelEditorNodeForGuid(*FlowGraph, NodeGuid);
-	if (!FlowGraphNode)
-	{
-		return false;
-	}
-
-	FlowGraph->Modify();
-	FlowGraphRegrapherDetail::BreakLinksAndDestroy(*FlowGraphNode);
-	return true;
-}
-
-int32 UFlowGraphRegrapher::PruneOrphanedEditorNodes(UFlowAsset* FlowAsset)
-{
-	UFlowGraph* FlowGraph = FlowAsset ? Cast<UFlowGraph>(FlowAsset->GetGraph()) : nullptr;
-	if (!FlowGraph)
-	{
-		return 0;
-	}
-
-	const TMap<FGuid, UFlowNode*>& RuntimeNodes = FlowAsset->GetNodes();
-
-	// Collect first: DestroyNode removes the entry from FlowGraph->Nodes, so the array cannot be
-	// mutated while it is being walked.
-	TArray<UFlowGraphNode*> OrphanedNodes;
-	for (UEdGraphNode* EdNode : FlowGraph->Nodes)
-	{
-		UFlowGraphNode* FlowGraphNode = Cast<UFlowGraphNode>(EdNode);
-		if (!FlowGraphNode || FlowGraphNode->GetParentNode())
-		{
-			continue;
-		}
-
-		// A null instance is left alone deliberately: the regraph's own creation loop links a
-		// freshly-created editor node to its runtime node only after FGraphNodeCreator finalizes it,
-		// so a momentarily instance-less node is not evidence of an orphan.
-		const UFlowNode* EdFlowNode = Cast<UFlowNode>(FlowGraphNode->GetFlowNodeBase());
-		if (!EdFlowNode)
-		{
-			continue;
-		}
-
-		if (!RuntimeNodes.Contains(EdFlowNode->GetGuid()))
-		{
-			OrphanedNodes.Add(FlowGraphNode);
-		}
-	}
-
-	if (OrphanedNodes.IsEmpty())
-	{
-		return 0;
-	}
-
-	FlowGraph->Modify();
-	for (UFlowGraphNode* OrphanedNode : OrphanedNodes)
-	{
-		UE_LOG(LogFlow, Warning, TEXT("UFlowGraphRegrapher::PruneOrphanedEditorNodes: destroying editor node '%s' - its runtime node is not registered on '%s'"),
-			*OrphanedNode->GetName(), *FlowAsset->GetPathName());
-		FlowGraphRegrapherDetail::BreakLinksAndDestroy(*OrphanedNode);
-	}
-	if (!FlowGraph->IsLocked())
-	{
-		FlowAsset->HarvestNodeConnections();
-	}
-
-	return OrphanedNodes.Num();
 }
 
 void UFlowGraphRegrapher::CollectGraphParityIssues(const UFlowAsset* FlowAsset, TArray<FString>& OutIssues)
@@ -1020,6 +847,179 @@ void UFlowGraphRegrapher::CollectGraphParityIssues(const UFlowAsset* FlowAsset, 
 			OutIssues.Add(FString::Printf(TEXT("Runtime connection %s has no editor link - it executes but is not drawn"), *RuntimeWire));
 		}
 	}
+}
+
+int32 UFlowGraphRegrapher::PruneOrphanedEditorNodes(UFlowAsset* FlowAsset)
+{
+	UFlowGraph* FlowGraph = FlowAsset ? Cast<UFlowGraph>(FlowAsset->GetGraph()) : nullptr;
+	if (!FlowGraph)
+	{
+		return 0;
+	}
+
+	const TMap<FGuid, UFlowNode*>& RuntimeNodes = FlowAsset->GetNodes();
+
+	// Collect first: DestroyNode removes the entry from FlowGraph->Nodes, so the array cannot be
+	// mutated while it is being walked.
+	TArray<UFlowGraphNode*> OrphanedNodes;
+	for (UEdGraphNode* EdNode : FlowGraph->Nodes)
+	{
+		UFlowGraphNode* FlowGraphNode = Cast<UFlowGraphNode>(EdNode);
+		if (!FlowGraphNode || FlowGraphNode->GetParentNode())
+		{
+			continue;
+		}
+
+		// A null instance is left alone deliberately: the regraph's own creation loop links a
+		// freshly-created editor node to its runtime node only after FGraphNodeCreator finalizes it,
+		// so a momentarily instance-less node is not evidence of an orphan.
+		const UFlowNode* EdFlowNode = Cast<UFlowNode>(FlowGraphNode->GetFlowNodeBase());
+		if (!EdFlowNode)
+		{
+			continue;
+		}
+
+		if (!RuntimeNodes.Contains(EdFlowNode->GetGuid()))
+		{
+			OrphanedNodes.Add(FlowGraphNode);
+		}
+	}
+
+	if (OrphanedNodes.IsEmpty())
+	{
+		return 0;
+	}
+
+	FlowGraph->Modify();
+	for (UFlowGraphNode* OrphanedNode : OrphanedNodes)
+	{
+		UE_LOG(LogFlow, Warning, TEXT("UFlowGraphRegrapher::PruneOrphanedEditorNodes: destroying editor node '%s' - its runtime node is not registered on '%s'"),
+			*OrphanedNode->GetName(), *FlowAsset->GetPathName());
+		FlowGraphRegrapherDetail::BreakLinksAndDestroy(*OrphanedNode);
+	}
+	if (!FlowGraph->IsLocked())
+	{
+		FlowAsset->HarvestNodeConnections();
+	}
+
+	return OrphanedNodes.Num();
+}
+
+bool UFlowGraphRegrapher::DestroyEditorNodeForRuntimeNode(UFlowAsset* FlowAsset, const FGuid& NodeGuid)
+{
+	UFlowGraph* FlowGraph = FlowAsset ? Cast<UFlowGraph>(FlowAsset->GetGraph()) : nullptr;
+	if (!FlowGraph)
+	{
+		// An asset built purely programmatically may never have had an editor graph; there is no
+		// editor node to destroy and nothing is wrong.
+		return false;
+	}
+
+	UFlowGraphNode* FlowGraphNode = FlowGraphRegrapherDetail::FindTopLevelEditorNodeForGuid(*FlowGraph, NodeGuid);
+	if (!FlowGraphNode)
+	{
+		return false;
+	}
+
+	FlowGraph->Modify();
+	FlowGraphRegrapherDetail::BreakLinksAndDestroy(*FlowGraphNode);
+	return true;
+}
+
+bool UFlowGraphRegrapher::RegraphFlowAsset(UFlowAsset* FlowAsset, const TMap<FGuid, FIntPoint>& NodePositions)
+{
+	static const TMap<FGuid, FString> NoComments;
+	return RegraphFlowAsset(FlowAsset, NodePositions, NoComments);
+}
+
+bool UFlowGraphRegrapher::RegraphFlowAsset(UFlowAsset* FlowAsset, const TMap<FGuid, FIntPoint>& NodePositions, const TMap<FGuid, FString>& NodeComments)
+{
+	if (!FlowAsset)
+	{
+		UE_LOG(LogFlow, Error, TEXT("UFlowGraphRegrapher::RegraphFlowAsset: FlowAsset is null"));
+		return false;
+	}
+	if (!GEditor)
+	{
+		UE_LOG(LogFlow, Error, TEXT("UFlowGraphRegrapher::RegraphFlowAsset: GEditor is not available"));
+		return false;
+	}
+	if (GEditor->IsPlaySessionInProgress())
+	{
+		UE_LOG(LogFlow, Error, TEXT("UFlowGraphRegrapher::RegraphFlowAsset: Cannot regraph during PIE"));
+		return false;
+	}
+	if (!FlowGraphRegrapherDetail::ValidateRuntimeGraphForRegraph(*FlowAsset))
+	{
+		return false;
+	}
+
+	FlowGraphRegrapherDetail::CacheFlowNodeOwnersForContextPins(*FlowAsset);
+	if (!FlowGraphRegrapherDetail::ValidateRuntimePinMetadata(*FlowAsset))
+	{
+		return false;
+	}
+	if (!FlowGraphRegrapherDetail::ValidateRuntimeConnectionsForRegraph(*FlowAsset))
+	{
+		return false;
+	}
+
+	// Ensure the FlowAsset has a UFlowGraph. If the asset already has real runtime nodes (e.g. from
+	// a FlowAgent import/reconcile), skip default node seeding - CreateDefaultNodesForGraph is only
+	// appropriate for a brand new, genuinely empty FlowAsset and would otherwise inject an unwanted
+	// extra Start node into the runtime Nodes map on this first regraph.
+	UFlowGraph* FlowGraph = Cast<UFlowGraph>(FlowAsset->GetGraph());
+	if (!FlowGraph)
+	{
+		const bool bCreateDefaultNodes = FlowAsset->GetNodes().IsEmpty();
+		UFlowGraph::CreateGraph(FlowAsset, UFlowGraphSchema::StaticClass(), bCreateDefaultNodes);
+		FlowGraph = Cast<UFlowGraph>(FlowAsset->GetGraph());
+		if (!FlowGraph)
+		{
+			UE_LOG(LogFlow, Error, TEXT("UFlowGraphRegrapher::RegraphFlowAsset: Failed to create editor graph for asset '%s'"),
+				*FlowAsset->GetPathName());
+			return false;
+		}
+	}
+
+	if (FlowGraph->IsLocked())
+	{
+		UE_LOG(LogFlow, Error, TEXT("UFlowGraphRegrapher::RegraphFlowAsset: Editor graph is already locked for asset '%s'"),
+			*FlowAsset->GetPathName());
+		return false;
+	}
+	FlowGraph->LockUpdates();
+
+	// Before anything is wired: drop editor nodes whose runtime node is gone. Their pin links are
+	// still live, and CreateEditorPinConnections' HarvestNodeConnections would otherwise harvest
+	// them straight back into the runtime Connections map, resurrecting connections to a node that
+	// no longer exists.
+	PruneOrphanedEditorNodes(FlowAsset);
+	if (!FlowGraphRegrapherDetail::ReconcileTopLevelEditorNodes(*FlowAsset, *FlowGraph, NodePositions, NodeComments))
+	{
+		return FlowGraphRegrapherDetail::AbortLockedRegraph(*FlowGraph);
+	}
+	TSet<UFlowGraphNode*> ParentNodesToReconstruct;
+	if (!FlowGraphRegrapherDetail::ReconcileEditorAddOnTrees(*FlowAsset, *FlowGraph, ParentNodesToReconstruct))
+	{
+		return FlowGraphRegrapherDetail::AbortLockedRegraph(*FlowGraph);
+	}
+	if (!FlowGraphRegrapherDetail::CreateRequiredEditorPins(*FlowAsset))
+	{
+		return FlowGraphRegrapherDetail::AbortLockedRegraph(*FlowGraph);
+	}
+	if (!FlowGraphRegrapherDetail::ReconcileEditorPinConnections(*FlowAsset, *FlowGraph))
+	{
+		return FlowGraphRegrapherDetail::AbortLockedRegraph(*FlowGraph);
+	}
+
+	FlowGraph->UnlockUpdatesWithoutReconcile();
+	// ReconcileEditorAddOnTrees changes the context pins supplied by AddOns, but the owning nodes'
+	// pin arrays can still reflect their previous AddOns. Reconstruct after unlocking so runtime and
+	// editor pins agree before NotifyGraphChanged harvests their connections.
+	FlowGraphRegrapherDetail::FinalizeParentNodePins(ParentNodesToReconstruct);
+	FlowGraph->NotifyGraphChanged();
+	return true;
 }
 
 namespace FlowGraphRegrapherDetail

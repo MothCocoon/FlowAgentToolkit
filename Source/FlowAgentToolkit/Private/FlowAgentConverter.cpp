@@ -99,14 +99,235 @@ bool FFlowAgentConverter::ParseDocument(
 	return true;
 }
 
-FString FFlowAgentConverter::GetJsonKeyForProperty(const FProperty* Property)
+void FFlowAgentConverter::ConvertToParsedGraph(
+	const FFlowAgentDocument& Document,
+	TArray<FFlowGraphParsedNode>& OutNodes,
+	TArray<FFlowGraphParsedConnection>& OutConnections,
+	TArray<FGuid>& OutScopedNodeGuids,
+	TMap<FString, FGuid>& OutAliasMap,
+	TArray<FFlowAgentIssue>& OutIssues)
 {
-	FString Key = Property->GetAuthoredName();
-	if (!Key.IsEmpty())
+	OutNodes.Reset();
+	OutConnections.Reset();
+	OutScopedNodeGuids.Reset();
+	OutAliasMap.Reset();
+
+	TArray<FGuid> ResolvedSelfGuid;
+	TArray<FGuid> ResolvedParentGuid;
+	ResolveIdentities(Document, OutAliasMap, ResolvedSelfGuid, ResolvedParentGuid, OutIssues);
+
+	for (int32 Index = 0; Index < Document.ScopeNodeGuids.Num(); ++Index)
 	{
-		Key[0] = FChar::ToLower(Key[0]);
+		FGuid Parsed;
+		if (TryParseGuid(Document.ScopeNodeGuids[Index], Parsed))
+		{
+			OutScopedNodeGuids.Add(Parsed);
+		}
+		else
+		{
+			AddIssue(OutIssues, EFlowValidationSeverity::Error, FString::Printf(TEXT("scopeNodeGuids[%d]"), Index), TEXT("BadGuid"),
+				FString::Printf(TEXT("'%s' is not a valid GUID."), *Document.ScopeNodeGuids[Index]));
+		}
 	}
-	return Key;
+
+	TSet<FGuid> ParsedNodeGuids;
+
+	for (int32 Index = 0; Index < Document.Ops.Num(); ++Index)
+	{
+		const FFlowAgentOp& Op = Document.Ops[Index];
+		const FGuid& SelfGuid = ResolvedSelfGuid[Index];
+
+		switch (Op.Kind)
+		{
+			case EFlowAgentOpKind::UpsertNode:
+			{
+				if (!SelfGuid.IsValid())
+				{
+					continue;
+				}
+
+				FFlowGraphParsedNode& Node = OutNodes.AddDefaulted_GetRef();
+				ParsedNodeGuids.Add(SelfGuid);
+				Node.NodeGuid = SelfGuid;
+				Node.NodeType = Op.Type;
+				Node.Properties = Op.Properties;
+
+				for (const FFlowAgentPin& Pin : Op.InputPins)
+				{
+					Node.InputPins.Add(RenderPinDeclBridge(Pin));
+				}
+				for (const FFlowAgentPin& Pin : Op.OutputPins)
+				{
+					Node.OutputPins.Add(RenderPinDeclBridge(Pin));
+				}
+
+				Node.bHasPos = Op.bHasPosition;
+				Node.Pos = Op.Position;
+				Node.bHasComment = !Op.Comment.IsEmpty();
+				Node.NodeComment = Op.Comment;
+				Node.bIsNewAlias = !Op.NewAlias.IsEmpty();
+				Node.Alias = Op.NewAlias;
+				Node.bIsFullBlock = Op.bReplaceAddons;
+				TSet<FGuid> AncestorGuids;
+				AncestorGuids.Add(SelfGuid);
+				Node.AddOns = BuildAddonChildren(Document, ResolvedSelfGuid, ResolvedParentGuid, SelfGuid, AncestorGuids, OutIssues);
+				break;
+			}
+
+			case EFlowAgentOpKind::DeleteNode:
+			{
+				if (!SelfGuid.IsValid())
+				{
+					continue;
+				}
+
+				FFlowGraphParsedNode& Node = OutNodes.AddDefaulted_GetRef();
+				Node.NodeGuid = SelfGuid;
+				Node.bIsDeleteMarker = true;
+				break;
+			}
+
+			case EFlowAgentOpKind::UpsertAddon:
+			case EFlowAgentOpKind::DeleteAddon:
+				// Folded into the owning node's (or ancestor addon's) nested AddOns list by
+				// BuildAddonChildren when that owner is converted above - nothing to append here.
+				break;
+
+			case EFlowAgentOpKind::AddConnection:
+			case EFlowAgentOpKind::RemoveConnection:
+			{
+				FGuid SourceGuid, TargetGuid;
+				bool bResolved = true;
+
+				if (!Op.Source.NodeAlias.IsEmpty())
+				{
+					if (const FGuid* Found = OutAliasMap.Find(Op.Source.NodeAlias))
+					{
+						SourceGuid = *Found;
+					}
+					else
+					{
+						AddIssue(OutIssues, EFlowValidationSeverity::Error, FString::Printf(TEXT("ops[%d].source.nodeAlias"), Index), TEXT("UnresolvedAlias"),
+							FString::Printf(TEXT("Alias '%s' is not defined by any op in this document."), *Op.Source.NodeAlias));
+						bResolved = false;
+					}
+				}
+				else if (!TryParseGuid(Op.Source.NodeGuid, SourceGuid))
+				{
+					AddIssue(OutIssues, EFlowValidationSeverity::Error, FString::Printf(TEXT("ops[%d].source.nodeGuid"), Index), TEXT("BadGuid"),
+						FString::Printf(TEXT("'%s' is not a valid GUID."), *Op.Source.NodeGuid));
+					bResolved = false;
+				}
+
+				if (!Op.Target.NodeAlias.IsEmpty())
+				{
+					if (const FGuid* Found = OutAliasMap.Find(Op.Target.NodeAlias))
+					{
+						TargetGuid = *Found;
+					}
+					else
+					{
+						AddIssue(OutIssues, EFlowValidationSeverity::Error, FString::Printf(TEXT("ops[%d].target.nodeAlias"), Index), TEXT("UnresolvedAlias"),
+							FString::Printf(TEXT("Alias '%s' is not defined by any op in this document."), *Op.Target.NodeAlias));
+						bResolved = false;
+					}
+				}
+				else if (!TryParseGuid(Op.Target.NodeGuid, TargetGuid))
+				{
+					AddIssue(OutIssues, EFlowValidationSeverity::Error, FString::Printf(TEXT("ops[%d].target.nodeGuid"), Index), TEXT("BadGuid"),
+						FString::Printf(TEXT("'%s' is not a valid GUID."), *Op.Target.NodeGuid));
+					bResolved = false;
+				}
+
+				if (!bResolved)
+				{
+					continue;
+				}
+
+				FFlowGraphParsedConnection& Connection = OutConnections.AddDefaulted_GetRef();
+				Connection.SourceNodeGuid = SourceGuid;
+				Connection.SourcePinName = FName(*Op.Source.Pin);
+				Connection.TargetNodeGuid = TargetGuid;
+				Connection.TargetPinName = FName(*Op.Target.Pin);
+				Connection.bIsDeleteMarker = (Op.Kind == EFlowAgentOpKind::RemoveConnection);
+				break;
+			}
+		}
+	}
+
+	TSet<FGuid> AddOnGuids;
+	TMap<FGuid, FGuid> AddOnParentGuids;
+	for (int32 Index = 0; Index < Document.Ops.Num(); ++Index)
+	{
+		const EFlowAgentOpKind Kind = Document.Ops[Index].Kind;
+		if ((Kind == EFlowAgentOpKind::UpsertAddon || Kind == EFlowAgentOpKind::DeleteAddon)
+			&& ResolvedSelfGuid[Index].IsValid())
+		{
+			AddOnGuids.Add(ResolvedSelfGuid[Index]);
+			AddOnParentGuids.Add(ResolvedSelfGuid[Index], ResolvedParentGuid[Index]);
+		}
+	}
+
+	TSet<FGuid> AddOnOwnerGuids;
+	for (int32 Index = 0; Index < Document.Ops.Num(); ++Index)
+	{
+		const EFlowAgentOpKind Kind = Document.Ops[Index].Kind;
+		if ((Kind == EFlowAgentOpKind::UpsertAddon || Kind == EFlowAgentOpKind::DeleteAddon)
+			&& ResolvedParentGuid[Index].IsValid()
+			&& !AddOnGuids.Contains(ResolvedParentGuid[Index]))
+		{
+			AddOnOwnerGuids.Add(ResolvedParentGuid[Index]);
+		}
+	}
+
+	for (const FGuid& OwnerGuid : AddOnOwnerGuids)
+	{
+		if (ParsedNodeGuids.Contains(OwnerGuid))
+		{
+			continue;
+		}
+
+		FFlowGraphParsedNode& Placeholder = OutNodes.AddDefaulted_GetRef();
+		Placeholder.NodeGuid = OwnerGuid;
+		TSet<FGuid> AncestorGuids;
+		AncestorGuids.Add(OwnerGuid);
+		Placeholder.AddOns = BuildAddonChildren(Document, ResolvedSelfGuid, ResolvedParentGuid, OwnerGuid, AncestorGuids, OutIssues);
+	}
+
+	TSet<FGuid> CheckedAddOnGuids;
+	for (int32 Index = 0; Index < Document.Ops.Num(); ++Index)
+	{
+		const FGuid& SelfGuid = ResolvedSelfGuid[Index];
+		if (!AddOnGuids.Contains(SelfGuid) || CheckedAddOnGuids.Contains(SelfGuid))
+		{
+			continue;
+		}
+
+		TSet<FGuid> AncestorGuids;
+		FGuid CurrentGuid = SelfGuid;
+		while (const FGuid* ParentGuid = AddOnParentGuids.Find(CurrentGuid))
+		{
+			if (CheckedAddOnGuids.Contains(CurrentGuid))
+			{
+				break;
+			}
+			if (AncestorGuids.Contains(CurrentGuid))
+			{
+				if (!OutIssues.ContainsByPredicate([&CurrentGuid](const FFlowAgentIssue& Issue)
+				{
+					return Issue.Code == TEXT("AddonCycle") && Issue.Message.Contains(CurrentGuid.ToString());
+				}))
+				{
+					AddIssue(OutIssues, EFlowValidationSeverity::Error, FString::Printf(TEXT("ops[%d].parentGuid"), Index), TEXT("AddonCycle"),
+						FString::Printf(TEXT("Addon '%s' forms a cycle in its parent chain."), *CurrentGuid.ToString()));
+				}
+				break;
+			}
+			AncestorGuids.Add(CurrentGuid);
+			CurrentGuid = *ParentGuid;
+		}
+		CheckedAddOnGuids.Append(AncestorGuids);
+	}
 }
 
 void FFlowAgentConverter::CheckUnknownFields(
@@ -178,6 +399,16 @@ void FFlowAgentConverter::CheckUnknownFields(
 		}
 	}
 
+}
+
+FString FFlowAgentConverter::GetJsonKeyForProperty(const FProperty* Property)
+{
+	FString Key = Property->GetAuthoredName();
+	if (!Key.IsEmpty())
+	{
+		Key[0] = FChar::ToLower(Key[0]);
+	}
+	return Key;
 }
 
 void FFlowAgentConverter::ValidateOpStructure(const FFlowAgentDocument& Document, TArray<FFlowAgentIssue>& OutIssues)
@@ -410,235 +641,4 @@ TArray<FFlowGraphParsedNodeAddOn> FFlowAgentConverter::BuildAddonChildren(
 	}
 
 	return Children;
-}
-
-void FFlowAgentConverter::ConvertToParsedGraph(
-	const FFlowAgentDocument& Document,
-	TArray<FFlowGraphParsedNode>& OutNodes,
-	TArray<FFlowGraphParsedConnection>& OutConnections,
-	TArray<FGuid>& OutScopedNodeGuids,
-	TMap<FString, FGuid>& OutAliasMap,
-	TArray<FFlowAgentIssue>& OutIssues)
-{
-	OutNodes.Reset();
-	OutConnections.Reset();
-	OutScopedNodeGuids.Reset();
-	OutAliasMap.Reset();
-
-	TArray<FGuid> ResolvedSelfGuid;
-	TArray<FGuid> ResolvedParentGuid;
-	ResolveIdentities(Document, OutAliasMap, ResolvedSelfGuid, ResolvedParentGuid, OutIssues);
-
-	for (int32 Index = 0; Index < Document.ScopeNodeGuids.Num(); ++Index)
-	{
-		FGuid Parsed;
-		if (TryParseGuid(Document.ScopeNodeGuids[Index], Parsed))
-		{
-			OutScopedNodeGuids.Add(Parsed);
-		}
-		else
-		{
-			AddIssue(OutIssues, EFlowValidationSeverity::Error, FString::Printf(TEXT("scopeNodeGuids[%d]"), Index), TEXT("BadGuid"),
-				FString::Printf(TEXT("'%s' is not a valid GUID."), *Document.ScopeNodeGuids[Index]));
-		}
-	}
-
-	TSet<FGuid> ParsedNodeGuids;
-
-	for (int32 Index = 0; Index < Document.Ops.Num(); ++Index)
-	{
-		const FFlowAgentOp& Op = Document.Ops[Index];
-		const FGuid& SelfGuid = ResolvedSelfGuid[Index];
-
-		switch (Op.Kind)
-		{
-			case EFlowAgentOpKind::UpsertNode:
-			{
-				if (!SelfGuid.IsValid())
-				{
-					continue;
-				}
-
-				FFlowGraphParsedNode& Node = OutNodes.AddDefaulted_GetRef();
-				ParsedNodeGuids.Add(SelfGuid);
-				Node.NodeGuid = SelfGuid;
-				Node.NodeType = Op.Type;
-				Node.Properties = Op.Properties;
-
-				for (const FFlowAgentPin& Pin : Op.InputPins)
-				{
-					Node.InputPins.Add(RenderPinDeclBridge(Pin));
-				}
-				for (const FFlowAgentPin& Pin : Op.OutputPins)
-				{
-					Node.OutputPins.Add(RenderPinDeclBridge(Pin));
-				}
-
-				Node.bHasPos = Op.bHasPosition;
-				Node.Pos = Op.Position;
-				Node.bHasComment = !Op.Comment.IsEmpty();
-				Node.NodeComment = Op.Comment;
-				Node.bIsNewAlias = !Op.NewAlias.IsEmpty();
-				Node.Alias = Op.NewAlias;
-				Node.bIsFullBlock = Op.bReplaceAddons;
-				TSet<FGuid> AncestorGuids;
-				AncestorGuids.Add(SelfGuid);
-				Node.AddOns = BuildAddonChildren(Document, ResolvedSelfGuid, ResolvedParentGuid, SelfGuid, AncestorGuids, OutIssues);
-				break;
-			}
-
-			case EFlowAgentOpKind::DeleteNode:
-			{
-				if (!SelfGuid.IsValid())
-				{
-					continue;
-				}
-
-				FFlowGraphParsedNode& Node = OutNodes.AddDefaulted_GetRef();
-				Node.NodeGuid = SelfGuid;
-				Node.bIsDeleteMarker = true;
-				break;
-			}
-
-			case EFlowAgentOpKind::UpsertAddon:
-			case EFlowAgentOpKind::DeleteAddon:
-				// Folded into the owning node's (or ancestor addon's) nested AddOns list by
-				// BuildAddonChildren when that owner is converted above - nothing to append here.
-				break;
-
-			case EFlowAgentOpKind::AddConnection:
-			case EFlowAgentOpKind::RemoveConnection:
-			{
-				FGuid SourceGuid, TargetGuid;
-				bool bResolved = true;
-
-				if (!Op.Source.NodeAlias.IsEmpty())
-				{
-					if (const FGuid* Found = OutAliasMap.Find(Op.Source.NodeAlias))
-					{
-						SourceGuid = *Found;
-					}
-					else
-					{
-						AddIssue(OutIssues, EFlowValidationSeverity::Error, FString::Printf(TEXT("ops[%d].source.nodeAlias"), Index), TEXT("UnresolvedAlias"),
-							FString::Printf(TEXT("Alias '%s' is not defined by any op in this document."), *Op.Source.NodeAlias));
-						bResolved = false;
-					}
-				}
-				else if (!TryParseGuid(Op.Source.NodeGuid, SourceGuid))
-				{
-					AddIssue(OutIssues, EFlowValidationSeverity::Error, FString::Printf(TEXT("ops[%d].source.nodeGuid"), Index), TEXT("BadGuid"),
-						FString::Printf(TEXT("'%s' is not a valid GUID."), *Op.Source.NodeGuid));
-					bResolved = false;
-				}
-
-				if (!Op.Target.NodeAlias.IsEmpty())
-				{
-					if (const FGuid* Found = OutAliasMap.Find(Op.Target.NodeAlias))
-					{
-						TargetGuid = *Found;
-					}
-					else
-					{
-						AddIssue(OutIssues, EFlowValidationSeverity::Error, FString::Printf(TEXT("ops[%d].target.nodeAlias"), Index), TEXT("UnresolvedAlias"),
-							FString::Printf(TEXT("Alias '%s' is not defined by any op in this document."), *Op.Target.NodeAlias));
-						bResolved = false;
-					}
-				}
-				else if (!TryParseGuid(Op.Target.NodeGuid, TargetGuid))
-				{
-					AddIssue(OutIssues, EFlowValidationSeverity::Error, FString::Printf(TEXT("ops[%d].target.nodeGuid"), Index), TEXT("BadGuid"),
-						FString::Printf(TEXT("'%s' is not a valid GUID."), *Op.Target.NodeGuid));
-					bResolved = false;
-				}
-
-				if (!bResolved)
-				{
-					continue;
-				}
-
-				FFlowGraphParsedConnection& Connection = OutConnections.AddDefaulted_GetRef();
-				Connection.SourceNodeGuid = SourceGuid;
-				Connection.SourcePinName = FName(*Op.Source.Pin);
-				Connection.TargetNodeGuid = TargetGuid;
-				Connection.TargetPinName = FName(*Op.Target.Pin);
-				Connection.bIsDeleteMarker = (Op.Kind == EFlowAgentOpKind::RemoveConnection);
-				break;
-			}
-		}
-	}
-
-	TSet<FGuid> AddOnGuids;
-	TMap<FGuid, FGuid> AddOnParentGuids;
-	for (int32 Index = 0; Index < Document.Ops.Num(); ++Index)
-	{
-		const EFlowAgentOpKind Kind = Document.Ops[Index].Kind;
-		if ((Kind == EFlowAgentOpKind::UpsertAddon || Kind == EFlowAgentOpKind::DeleteAddon)
-			&& ResolvedSelfGuid[Index].IsValid())
-		{
-			AddOnGuids.Add(ResolvedSelfGuid[Index]);
-			AddOnParentGuids.Add(ResolvedSelfGuid[Index], ResolvedParentGuid[Index]);
-		}
-	}
-
-	TSet<FGuid> AddOnOwnerGuids;
-	for (int32 Index = 0; Index < Document.Ops.Num(); ++Index)
-	{
-		const EFlowAgentOpKind Kind = Document.Ops[Index].Kind;
-		if ((Kind == EFlowAgentOpKind::UpsertAddon || Kind == EFlowAgentOpKind::DeleteAddon)
-			&& ResolvedParentGuid[Index].IsValid()
-			&& !AddOnGuids.Contains(ResolvedParentGuid[Index]))
-		{
-			AddOnOwnerGuids.Add(ResolvedParentGuid[Index]);
-		}
-	}
-
-	for (const FGuid& OwnerGuid : AddOnOwnerGuids)
-	{
-		if (ParsedNodeGuids.Contains(OwnerGuid))
-		{
-			continue;
-		}
-
-		FFlowGraphParsedNode& Placeholder = OutNodes.AddDefaulted_GetRef();
-		Placeholder.NodeGuid = OwnerGuid;
-		TSet<FGuid> AncestorGuids;
-		AncestorGuids.Add(OwnerGuid);
-		Placeholder.AddOns = BuildAddonChildren(Document, ResolvedSelfGuid, ResolvedParentGuid, OwnerGuid, AncestorGuids, OutIssues);
-	}
-
-	TSet<FGuid> CheckedAddOnGuids;
-	for (int32 Index = 0; Index < Document.Ops.Num(); ++Index)
-	{
-		const FGuid& SelfGuid = ResolvedSelfGuid[Index];
-		if (!AddOnGuids.Contains(SelfGuid) || CheckedAddOnGuids.Contains(SelfGuid))
-		{
-			continue;
-		}
-
-		TSet<FGuid> AncestorGuids;
-		FGuid CurrentGuid = SelfGuid;
-		while (const FGuid* ParentGuid = AddOnParentGuids.Find(CurrentGuid))
-		{
-			if (CheckedAddOnGuids.Contains(CurrentGuid))
-			{
-				break;
-			}
-			if (AncestorGuids.Contains(CurrentGuid))
-			{
-				if (!OutIssues.ContainsByPredicate([&CurrentGuid](const FFlowAgentIssue& Issue)
-				{
-					return Issue.Code == TEXT("AddonCycle") && Issue.Message.Contains(CurrentGuid.ToString());
-				}))
-				{
-					AddIssue(OutIssues, EFlowValidationSeverity::Error, FString::Printf(TEXT("ops[%d].parentGuid"), Index), TEXT("AddonCycle"),
-						FString::Printf(TEXT("Addon '%s' forms a cycle in its parent chain."), *CurrentGuid.ToString()));
-				}
-				break;
-			}
-			AncestorGuids.Add(CurrentGuid);
-			CurrentGuid = *ParentGuid;
-		}
-		CheckedAddOnGuids.Append(AncestorGuids);
-	}
 }

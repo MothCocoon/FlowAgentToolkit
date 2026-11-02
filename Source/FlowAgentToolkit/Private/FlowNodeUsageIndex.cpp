@@ -42,144 +42,6 @@ FFlowNodeUsageIndex& FFlowNodeUsageIndex::Get()
 	return Instance;
 }
 
-void FFlowNodeUsageIndex::Invalidate()
-{
-	ClassUsage.Reset();
-	AssetNodeCounts.Reset();
-	bBuilt = false;
-}
-
-void FFlowNodeUsageIndex::RegisterCallbacks()
-{
-	if (!PackageSavedHandle.IsValid())
-	{
-		PackageSavedHandle = UPackage::PackageSavedWithContextEvent.AddRaw(this, &FFlowNodeUsageIndex::OnPackageSaved);
-	}
-}
-
-void FFlowNodeUsageIndex::UnregisterCallbacks()
-{
-	if (PackageSavedHandle.IsValid())
-	{
-		UPackage::PackageSavedWithContextEvent.Remove(PackageSavedHandle);
-		PackageSavedHandle.Reset();
-	}
-}
-
-void FFlowNodeUsageIndex::OnPackageSaved(const FString& PackageFileName, UPackage* Package, FObjectPostSaveContext Context)
-{
-	if (!bBuilt || !Package)
-	{
-		return;
-	}
-
-	// Re-index only the saved asset to keep save-time work proportional to that package.
-	TArray<UObject*> Objects;
-	GetObjectsWithOuter(Package, Objects, EGetObjectsFlags::None);
-	for (UObject* Object : Objects)
-	{
-		if (const UFlowAsset* FlowAsset = Cast<UFlowAsset>(Object))
-		{
-			ForgetAsset(FlowAsset->GetPathName());
-			IndexAsset(*FlowAsset);
-		}
-	}
-}
-
-void FFlowNodeUsageIndex::ForgetAsset(const FString& AssetPath)
-{
-	AssetNodeCounts.Remove(AssetPath);
-
-	for (auto It = ClassUsage.CreateIterator(); It; ++It)
-	{
-		FClassUsageRecord& Record = It.Value();
-		int32 RemovedInstances = 0;
-		Record.AssetToInstanceCount.RemoveAndCopyValue(AssetPath, RemovedInstances);
-		Record.InstanceCount -= RemovedInstances;
-
-		Record.Snippets.RemoveAll([&AssetPath](const FString& Snippet) { return Snippet.StartsWith(AssetPath + TEXT(" ::")); });
-
-		if (Record.AssetToInstanceCount.IsEmpty())
-		{
-			It.RemoveCurrent();
-		}
-	}
-}
-
-void FFlowNodeUsageIndex::IndexAsset(const UFlowAsset& FlowAsset)
-{
-	const FString AssetPath = FlowAsset.GetPathName();
-	const TMap<FGuid, UFlowNode*>& Nodes = FlowAsset.GetNodes();
-	AssetNodeCounts.Add(AssetPath, Nodes.Num());
-
-	// Recording an addon against its parent's record is what makes "commonly co-attached" answerable,
-	// and is the only place a pin contributed by an attached addon is observable at all.
-	auto RecordInstance = [this, &FlowAsset, &AssetPath](const UFlowNodeBase& Instance, const UFlowNodeBase* Parent)
-	{
-		const FString ClassPath = Instance.GetClass()->GetPathName();
-		FClassUsageRecord& Record = ClassUsage.FindOrAdd(ClassPath);
-		++Record.InstanceCount;
-		++Record.AssetToInstanceCount.FindOrAdd(AssetPath);
-		Record.Snippets.Add(MakeInstanceSnippet(FlowAsset, Instance));
-
-		if (Parent)
-		{
-			FClassUsageRecord& ParentRecord = ClassUsage.FindOrAdd(Parent->GetClass()->GetPathName());
-			++ParentRecord.CoAttachedAddOnCounts.FindOrAdd(ClassPath);
-		}
-	};
-
-	for (const TPair<FGuid, UFlowNode*>& Pair : Nodes)
-	{
-		const UFlowNode* Node = Pair.Value;
-		if (!Node)
-		{
-			continue;
-		}
-
-		RecordInstance(*Node, nullptr);
-
-		Node->ForEachAddOnConst([&RecordInstance, Node](const UFlowNodeAddOn& AddOn)
-		{
-			RecordInstance(AddOn, Node);
-			return EFlowForEachAddOnFunctionReturnValue::Continue;
-		});
-	}
-}
-
-void FFlowNodeUsageIndex::EnsureBuilt()
-{
-	if (bBuilt)
-	{
-		return;
-	}
-
-	// Set the flag before the sweep so a re-entrant query cannot start a second build.
-	bBuilt = true;
-	RegisterCallbacks();
-
-	FARFilter Filter;
-	Filter.ClassPaths.Add(UFlowAsset::StaticClass()->GetClassPathName());
-	Filter.bRecursiveClasses = true;
-
-	TArray<FAssetData> FoundAssets;
-	const FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(AssetRegistryConstants::ModuleName);
-	AssetRegistryModule.Get().GetAssets(Filter, FoundAssets);
-
-	int32 IndexedAssetCount = 0;
-	for (const FAssetData& AssetData : FoundAssets)
-	{
-		if (const UFlowAsset* FlowAsset = Cast<UFlowAsset>(AssetData.GetAsset()))
-		{
-			IndexAsset(*FlowAsset);
-			++IndexedAssetCount;
-		}
-	}
-
-	UE_LOG(LogFlow, Log, TEXT("FlowNodeUsageIndex: indexed %d FlowAssets covering %d node/addon classes."),
-		IndexedAssetCount, ClassUsage.Num());
-}
-
 FFlowNodeUsageSummary FFlowNodeUsageIndex::GetUsageSummary(const FString& ClassPath)
 {
 	EnsureBuilt();
@@ -275,4 +137,142 @@ FFlowNodeUsageResult FFlowNodeUsageIndex::QueryUsage(const FString& ClassPath, i
 	}
 
 	return Result;
+}
+
+void FFlowNodeUsageIndex::Invalidate()
+{
+	ClassUsage.Reset();
+	AssetNodeCounts.Reset();
+	bBuilt = false;
+}
+
+void FFlowNodeUsageIndex::RegisterCallbacks()
+{
+	if (!PackageSavedHandle.IsValid())
+	{
+		PackageSavedHandle = UPackage::PackageSavedWithContextEvent.AddRaw(this, &FFlowNodeUsageIndex::OnPackageSaved);
+	}
+}
+
+void FFlowNodeUsageIndex::UnregisterCallbacks()
+{
+	if (PackageSavedHandle.IsValid())
+	{
+		UPackage::PackageSavedWithContextEvent.Remove(PackageSavedHandle);
+		PackageSavedHandle.Reset();
+	}
+}
+
+void FFlowNodeUsageIndex::EnsureBuilt()
+{
+	if (bBuilt)
+	{
+		return;
+	}
+
+	// Set the flag before the sweep so a re-entrant query cannot start a second build.
+	bBuilt = true;
+	RegisterCallbacks();
+
+	FARFilter Filter;
+	Filter.ClassPaths.Add(UFlowAsset::StaticClass()->GetClassPathName());
+	Filter.bRecursiveClasses = true;
+
+	TArray<FAssetData> FoundAssets;
+	const FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(AssetRegistryConstants::ModuleName);
+	AssetRegistryModule.Get().GetAssets(Filter, FoundAssets);
+
+	int32 IndexedAssetCount = 0;
+	for (const FAssetData& AssetData : FoundAssets)
+	{
+		if (const UFlowAsset* FlowAsset = Cast<UFlowAsset>(AssetData.GetAsset()))
+		{
+			IndexAsset(*FlowAsset);
+			++IndexedAssetCount;
+		}
+	}
+
+	UE_LOG(LogFlow, Log, TEXT("FlowNodeUsageIndex: indexed %d FlowAssets covering %d node/addon classes."),
+		IndexedAssetCount, ClassUsage.Num());
+}
+
+void FFlowNodeUsageIndex::IndexAsset(const UFlowAsset& FlowAsset)
+{
+	const FString AssetPath = FlowAsset.GetPathName();
+	const TMap<FGuid, UFlowNode*>& Nodes = FlowAsset.GetNodes();
+	AssetNodeCounts.Add(AssetPath, Nodes.Num());
+
+	// Recording an addon against its parent's record is what makes "commonly co-attached" answerable,
+	// and is the only place a pin contributed by an attached addon is observable at all.
+	auto RecordInstance = [this, &FlowAsset, &AssetPath](const UFlowNodeBase& Instance, const UFlowNodeBase* Parent)
+	{
+		const FString ClassPath = Instance.GetClass()->GetPathName();
+		FClassUsageRecord& Record = ClassUsage.FindOrAdd(ClassPath);
+		++Record.InstanceCount;
+		++Record.AssetToInstanceCount.FindOrAdd(AssetPath);
+		Record.Snippets.Add(MakeInstanceSnippet(FlowAsset, Instance));
+
+		if (Parent)
+		{
+			FClassUsageRecord& ParentRecord = ClassUsage.FindOrAdd(Parent->GetClass()->GetPathName());
+			++ParentRecord.CoAttachedAddOnCounts.FindOrAdd(ClassPath);
+		}
+	};
+
+	for (const TPair<FGuid, UFlowNode*>& Pair : Nodes)
+	{
+		const UFlowNode* Node = Pair.Value;
+		if (!Node)
+		{
+			continue;
+		}
+
+		RecordInstance(*Node, nullptr);
+
+		Node->ForEachAddOnConst([&RecordInstance, Node](const UFlowNodeAddOn& AddOn)
+		{
+			RecordInstance(AddOn, Node);
+			return EFlowForEachAddOnFunctionReturnValue::Continue;
+		});
+	}
+}
+
+void FFlowNodeUsageIndex::ForgetAsset(const FString& AssetPath)
+{
+	AssetNodeCounts.Remove(AssetPath);
+
+	for (auto It = ClassUsage.CreateIterator(); It; ++It)
+	{
+		FClassUsageRecord& Record = It.Value();
+		int32 RemovedInstances = 0;
+		Record.AssetToInstanceCount.RemoveAndCopyValue(AssetPath, RemovedInstances);
+		Record.InstanceCount -= RemovedInstances;
+
+		Record.Snippets.RemoveAll([&AssetPath](const FString& Snippet) { return Snippet.StartsWith(AssetPath + TEXT(" ::")); });
+
+		if (Record.AssetToInstanceCount.IsEmpty())
+		{
+			It.RemoveCurrent();
+		}
+	}
+}
+
+void FFlowNodeUsageIndex::OnPackageSaved(const FString& PackageFileName, UPackage* Package, FObjectPostSaveContext Context)
+{
+	if (!bBuilt || !Package)
+	{
+		return;
+	}
+
+	// Re-index only the saved asset to keep save-time work proportional to that package.
+	TArray<UObject*> Objects;
+	GetObjectsWithOuter(Package, Objects, EGetObjectsFlags::None);
+	for (UObject* Object : Objects)
+	{
+		if (const UFlowAsset* FlowAsset = Cast<UFlowAsset>(Object))
+		{
+			ForgetAsset(FlowAsset->GetPathName());
+			IndexAsset(*FlowAsset);
+		}
+	}
 }

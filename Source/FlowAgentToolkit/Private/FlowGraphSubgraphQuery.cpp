@@ -8,139 +8,6 @@
 #include "Nodes/FlowPin.h"
 #include "EdGraph/EdGraphNode.h"
 
-FString FFlowGraphSubgraphQuery::ResolveNodeTitle(const UFlowNode* Node)
-{
-	if (!Node)
-	{
-		return TEXT("");
-	}
-
-	if (const UEdGraphNode* EdGraphNode = Node->GetGraphNode())
-	{
-		return EdGraphNode->GetNodeTitle(ENodeTitleType::ListView).ToString();
-	}
-
-	return Node->GetClass()->GetName();
-}
-
-void FFlowGraphSubgraphQuery::ComputeIncomingConnectionTargets(const UFlowAsset* Asset, TSet<FGuid>& OutTargets)
-{
-	OutTargets.Reset();
-	if (!Asset)
-	{
-		return;
-	}
-
-	// Mirrors UFlowGraphExporter::ExportConnections' storage-direction handling: exec connections
-	// are stored on the source node keyed by its output pin (the value is the target); data
-	// connections are stored on the receiving node keyed by its own input pin (the value is the
-	// source). Either way, "the other endpoint" recorded in a valid FConnectedPin is the target of
-	// an exec edge or the source of a data edge - for entry-point purposes we only need "is this
-	// node ever the target of an exec edge", plus "does this node itself have any incoming data
-	// connection" (checked directly on the node in the caller, not via this map).
-	for (const TPair<FGuid, UFlowNode*>& NodePair : Asset->GetNodes())
-	{
-		const UFlowNode* Node = NodePair.Value;
-		if (!Node)
-		{
-			continue;
-		}
-
-		for (const FFlowPin& OutputPin : Node->GetOutputPins())
-		{
-			if (!OutputPin.IsExecPin())
-			{
-				continue;
-			}
-
-			const FConnectedPin Connection = Node->GetConnection(OutputPin.PinName);
-			if (Connection.NodeGuid.IsValid())
-			{
-				OutTargets.Add(Connection.NodeGuid);
-			}
-		}
-	}
-}
-
-void FFlowGraphSubgraphQuery::ComputeConnectedComponent(const UFlowAsset* Asset, const FGuid& StartNodeGuid, TSet<FGuid>& OutComponent)
-{
-	OutComponent.Reset();
-	if (!Asset)
-	{
-		return;
-	}
-
-	// Build a full undirected adjacency list in one pass (RS12: exec + data, both directions).
-	// Exec: this node -> Connection.NodeGuid. Data: Connection.NodeGuid -> this node (the connection
-	// is stored on the receiving node, so its value is the upstream source).
-	TMap<FGuid, TArray<FGuid>> Adjacency;
-	for (const TPair<FGuid, UFlowNode*>& NodePair : Asset->GetNodes())
-	{
-		const FGuid& NodeGuid = NodePair.Key;
-		const UFlowNode* Node = NodePair.Value;
-		if (!Node)
-		{
-			continue;
-		}
-
-		for (const FFlowPin& OutputPin : Node->GetOutputPins())
-		{
-			if (!OutputPin.IsExecPin())
-			{
-				continue;
-			}
-
-			const FConnectedPin Connection = Node->GetConnection(OutputPin.PinName);
-			if (Connection.NodeGuid.IsValid())
-			{
-				Adjacency.FindOrAdd(NodeGuid).Add(Connection.NodeGuid);
-				Adjacency.FindOrAdd(Connection.NodeGuid).Add(NodeGuid);
-			}
-		}
-
-		for (const FFlowPin& InputPin : Node->GetInputPins())
-		{
-			if (InputPin.IsExecPin())
-			{
-				continue;
-			}
-
-			const FConnectedPin Connection = Node->GetConnection(InputPin.PinName);
-			if (Connection.NodeGuid.IsValid())
-			{
-				Adjacency.FindOrAdd(NodeGuid).Add(Connection.NodeGuid);
-				Adjacency.FindOrAdd(Connection.NodeGuid).Add(NodeGuid);
-			}
-		}
-	}
-
-	if (!Asset->GetNodes().Contains(StartNodeGuid))
-	{
-		return;
-	}
-
-	// Standard BFS. OutComponent always ends up containing StartNodeGuid, even with zero edges.
-	TArray<FGuid> Frontier;
-	Frontier.Add(StartNodeGuid);
-	OutComponent.Add(StartNodeGuid);
-
-	while (!Frontier.IsEmpty())
-	{
-		const FGuid Current = Frontier.Pop();
-		if (const TArray<FGuid>* Neighbors = Adjacency.Find(Current))
-		{
-			for (const FGuid& Neighbor : *Neighbors)
-			{
-				if (!OutComponent.Contains(Neighbor))
-				{
-					OutComponent.Add(Neighbor);
-					Frontier.Add(Neighbor);
-				}
-			}
-		}
-	}
-}
-
 bool FFlowGraphSubgraphQuery::FindNodes(
 	const UFlowAsset* Asset,
 	const FString& TitleFilter,
@@ -266,4 +133,137 @@ bool FFlowGraphSubgraphQuery::ExportSubgraph(
 	OutExportText = UFlowGraphExporter::ExportFlowGraphSubsetToString(Asset, Component);
 	OutNodeCount = Component.Num();
 	return true;
+}
+
+void FFlowGraphSubgraphQuery::ComputeConnectedComponent(const UFlowAsset* Asset, const FGuid& StartNodeGuid, TSet<FGuid>& OutComponent)
+{
+	OutComponent.Reset();
+	if (!Asset)
+	{
+		return;
+	}
+
+	// Build a full undirected adjacency list in one pass (RS12: exec + data, both directions).
+	// Exec: this node -> Connection.NodeGuid. Data: Connection.NodeGuid -> this node (the connection
+	// is stored on the receiving node, so its value is the upstream source).
+	TMap<FGuid, TArray<FGuid>> Adjacency;
+	for (const TPair<FGuid, UFlowNode*>& NodePair : Asset->GetNodes())
+	{
+		const FGuid& NodeGuid = NodePair.Key;
+		const UFlowNode* Node = NodePair.Value;
+		if (!Node)
+		{
+			continue;
+		}
+
+		for (const FFlowPin& OutputPin : Node->GetOutputPins())
+		{
+			if (!OutputPin.IsExecPin())
+			{
+				continue;
+			}
+
+			const FConnectedPin Connection = Node->GetConnection(OutputPin.PinName);
+			if (Connection.NodeGuid.IsValid())
+			{
+				Adjacency.FindOrAdd(NodeGuid).Add(Connection.NodeGuid);
+				Adjacency.FindOrAdd(Connection.NodeGuid).Add(NodeGuid);
+			}
+		}
+
+		for (const FFlowPin& InputPin : Node->GetInputPins())
+		{
+			if (InputPin.IsExecPin())
+			{
+				continue;
+			}
+
+			const FConnectedPin Connection = Node->GetConnection(InputPin.PinName);
+			if (Connection.NodeGuid.IsValid())
+			{
+				Adjacency.FindOrAdd(NodeGuid).Add(Connection.NodeGuid);
+				Adjacency.FindOrAdd(Connection.NodeGuid).Add(NodeGuid);
+			}
+		}
+	}
+
+	if (!Asset->GetNodes().Contains(StartNodeGuid))
+	{
+		return;
+	}
+
+	// Standard BFS. OutComponent always ends up containing StartNodeGuid, even with zero edges.
+	TArray<FGuid> Frontier;
+	Frontier.Add(StartNodeGuid);
+	OutComponent.Add(StartNodeGuid);
+
+	while (!Frontier.IsEmpty())
+	{
+		const FGuid Current = Frontier.Pop();
+		if (const TArray<FGuid>* Neighbors = Adjacency.Find(Current))
+		{
+			for (const FGuid& Neighbor : *Neighbors)
+			{
+				if (!OutComponent.Contains(Neighbor))
+				{
+					OutComponent.Add(Neighbor);
+					Frontier.Add(Neighbor);
+				}
+			}
+		}
+	}
+}
+
+void FFlowGraphSubgraphQuery::ComputeIncomingConnectionTargets(const UFlowAsset* Asset, TSet<FGuid>& OutTargets)
+{
+	OutTargets.Reset();
+	if (!Asset)
+	{
+		return;
+	}
+
+	// Mirrors UFlowGraphExporter::ExportConnections' storage-direction handling: exec connections
+	// are stored on the source node keyed by its output pin (the value is the target); data
+	// connections are stored on the receiving node keyed by its own input pin (the value is the
+	// source). Either way, "the other endpoint" recorded in a valid FConnectedPin is the target of
+	// an exec edge or the source of a data edge - for entry-point purposes we only need "is this
+	// node ever the target of an exec edge", plus "does this node itself have any incoming data
+	// connection" (checked directly on the node in the caller, not via this map).
+	for (const TPair<FGuid, UFlowNode*>& NodePair : Asset->GetNodes())
+	{
+		const UFlowNode* Node = NodePair.Value;
+		if (!Node)
+		{
+			continue;
+		}
+
+		for (const FFlowPin& OutputPin : Node->GetOutputPins())
+		{
+			if (!OutputPin.IsExecPin())
+			{
+				continue;
+			}
+
+			const FConnectedPin Connection = Node->GetConnection(OutputPin.PinName);
+			if (Connection.NodeGuid.IsValid())
+			{
+				OutTargets.Add(Connection.NodeGuid);
+			}
+		}
+	}
+}
+
+FString FFlowGraphSubgraphQuery::ResolveNodeTitle(const UFlowNode* Node)
+{
+	if (!Node)
+	{
+		return TEXT("");
+	}
+
+	if (const UEdGraphNode* EdGraphNode = Node->GetGraphNode())
+	{
+		return EdGraphNode->GetNodeTitle(ENodeTitleType::ListView).ToString();
+	}
+
+	return Node->GetClass()->GetName();
 }

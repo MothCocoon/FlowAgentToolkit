@@ -11,24 +11,6 @@
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
 
-void FFlowGraphValidation::AddFinding(
-	TArray<FFlowValidationFinding>& OutFindings,
-	EFlowValidationSeverity Severity,
-	const FString& Code,
-	const FString& Message,
-	const FGuid& NodeGuid,
-	const FGuid& AddOnGuid,
-	FName PinName)
-{
-	FFlowValidationFinding& Finding = OutFindings.AddDefaulted_GetRef();
-	Finding.Severity = Severity;
-	Finding.Code = Code;
-	Finding.Message = Message;
-	Finding.NodeGuid = NodeGuid;
-	Finding.AddOnGuid = AddOnGuid;
-	Finding.PinName = PinName;
-}
-
 // Meyers-singleton registry storage - avoids static-initialization-order issues with a
 // module-level global. Keyed by the exact UClass RegisterHook was called with.
 static TMap<TSubclassOf<UFlowAsset>, TArray<FFlowValidationHookDelegate>>& GetHookRegistry()
@@ -41,36 +23,6 @@ static TMap<TSubclassOf<UFlowAsset>, TArray<FFlowContextValidationHookDelegate>>
 {
 	static TMap<TSubclassOf<UFlowAsset>, TArray<FFlowContextValidationHookDelegate>> Registry;
 	return Registry;
-}
-
-void FFlowGraphValidation::RegisterHook(TSubclassOf<UFlowAsset> AssetClass, FFlowValidationHookDelegate Hook)
-{
-	if (!AssetClass || !Hook.IsBound())
-	{
-		return;
-	}
-	GetHookRegistry().FindOrAdd(AssetClass).Add(MoveTemp(Hook));
-}
-
-void FFlowGraphValidation::UnregisterHooksForClass(TSubclassOf<UFlowAsset> AssetClass)
-{
-	GetHookRegistry().Remove(AssetClass);
-}
-
-void FFlowGraphValidation::RegisterContextHook(
-	TSubclassOf<UFlowAsset> AssetClass,
-	FFlowContextValidationHookDelegate Hook)
-{
-	if (!AssetClass || !Hook.IsBound())
-	{
-		return;
-	}
-	GetContextHookRegistry().FindOrAdd(AssetClass).Add(MoveTemp(Hook));
-}
-
-void FFlowGraphValidation::UnregisterContextHooksForClass(TSubclassOf<UFlowAsset> AssetClass)
-{
-	GetContextHookRegistry().Remove(AssetClass);
 }
 
 static bool HasPinNamed(const TArray<FFlowPin>& Pins, FName PinName)
@@ -103,6 +55,279 @@ static bool HasNodePin(const UFlowNode& Node, FName PinName, bool bIsOutputPin)
 	const TArray<FFlowPin>& StaticPins = bIsOutputPin ? Node.GetOutputPins() : Node.GetInputPins();
 	const TArray<FFlowPin> ContextPins = bIsOutputPin ? Node.GetContextOutputs() : Node.GetContextInputs();
 	return HasPinNamed(StaticPins, PinName) || HasPinNamed(ContextPins, PinName);
+}
+
+bool FFlowGraphValidation::ValidateDocument(
+	const UFlowAsset* TargetAsset,
+	const TArray<FFlowGraphParsedNode>& ParsedNodes,
+	const TArray<FFlowGraphParsedConnection>& ParsedConnections,
+	TArray<FFlowValidationFinding>& OutFindings,
+	const TSet<FGuid>* PostPlanNodeGuids,
+	const FFlowProjectedPinSchema* ProjectedPinSchema,
+	const FFlowValidationContext* ValidationContext)
+{
+	// Validate structure first, then connection endpoints and types against the projected pin schema.
+	ValidateNodes(TargetAsset, ParsedNodes, OutFindings);
+	ValidateConnections(TargetAsset, ParsedNodes, ParsedConnections, OutFindings, PostPlanNodeGuids, ProjectedPinSchema);
+	FFlowValidationContext DefaultValidationContext;
+	if (!ValidationContext)
+	{
+		DefaultValidationContext.TargetAsset = TargetAsset;
+		DefaultValidationContext.EffectiveAsset = TargetAsset;
+		DefaultValidationContext.ResolvedAssetClass = IsValid(TargetAsset) ? TargetAsset->GetClass() : nullptr;
+		ValidationContext = &DefaultValidationContext;
+	}
+
+	RunContextValidationHooks(*ValidationContext, ParsedNodes, ParsedConnections, OutFindings);
+	const UFlowAsset* LegacyHookTarget = IsValid(ValidationContext->TargetAsset)
+		? ValidationContext->TargetAsset
+		: TargetAsset;
+	RunValidationHooks(LegacyHookTarget, ParsedNodes, ParsedConnections, OutFindings);
+
+	return HasNoErrors(OutFindings);
+}
+
+bool FFlowGraphValidation::HasNoErrors(const TArray<FFlowValidationFinding>& Findings)
+{
+	for (const FFlowValidationFinding& Finding : Findings)
+	{
+		if (Finding.Severity == EFlowValidationSeverity::Error)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+bool FFlowGraphValidation::DoesRuntimePinSchemaMatchProjected(
+	const UFlowAsset* FlowAsset,
+	const FFlowProjectedPinSchema& ProjectedPinSchema,
+	FString& OutErrorMessage)
+{
+	OutErrorMessage.Reset();
+	if (!IsValid(FlowAsset))
+	{
+		OutErrorMessage = TEXT("Cannot compare projected pins because the FlowAsset is invalid");
+		return false;
+	}
+
+	// Rebuild the same active set used by pin assembly. Editor orphan pins are not runtime endpoints.
+	const auto BuildActivePins = [](const TArray<FFlowPin>& StaticPins, const TArray<FFlowPin>& ContextPins)
+	{
+		TArray<FFlowPin> ActivePins = StaticPins;
+		for (const FFlowPin& ContextPin : ContextPins)
+		{
+			if (!ContextPin.PinName.IsNone() && !HasPinNamed(ActivePins, ContextPin.PinName))
+			{
+				ActivePins.Add(ContextPin);
+			}
+		}
+		return ActivePins;
+	};
+
+	// Compare ordered pin identity, category, and subcategory so commit cannot wire against a schema
+	// different from the one accepted during preflight.
+	const auto DoPinListsMatch = [](const TArray<FFlowPin>& ActualPins, const TArray<FFlowPin>& ExpectedPins)
+	{
+		if (ActualPins.Num() != ExpectedPins.Num())
+		{
+			return false;
+		}
+
+		for (int32 PinIndex = 0; PinIndex < ActualPins.Num(); ++PinIndex)
+		{
+			const FFlowPin& ActualPin = ActualPins[PinIndex];
+			const FFlowPin& ExpectedPin = ExpectedPins[PinIndex];
+			if (ActualPin.PinName != ExpectedPin.PinName ||
+				ActualPin.GetPinTypeName().Name != ExpectedPin.GetPinTypeName().Name ||
+				ActualPin.GetPinSubCategoryObject().Get() != ExpectedPin.GetPinSubCategoryObject().Get())
+			{
+				return false;
+			}
+		}
+
+		return true;
+	};
+
+	// Verify every surviving node before the importer installs any requested connections.
+	for (const TPair<FGuid, FFlowProjectedPinSet>& ProjectedPair : ProjectedPinSchema)
+	{
+		const UFlowNode* const Node = FlowAsset->GetNode(ProjectedPair.Key);
+		if (!IsValid(Node))
+		{
+			OutErrorMessage = FString::Printf(TEXT("Projected node %s is missing before connection setup"),
+				*ProjectedPair.Key.ToString());
+			return false;
+		}
+
+		const TArray<FFlowPin> ActualInputs = BuildActivePins(Node->GetInputPins(), Node->GetContextInputs());
+		const TArray<FFlowPin> ActualOutputs = BuildActivePins(Node->GetOutputPins(), Node->GetContextOutputs());
+		if (!DoPinListsMatch(ActualInputs, ProjectedPair.Value.InputPins) ||
+			!DoPinListsMatch(ActualOutputs, ProjectedPair.Value.OutputPins))
+		{
+			OutErrorMessage = FString::Printf(TEXT("Active pins on node %s differ from the schema validated by FlowAgent"),
+				*ProjectedPair.Key.ToString());
+			return false;
+		}
+	}
+
+	return true;
+}
+
+void FFlowGraphValidation::RegisterHook(TSubclassOf<UFlowAsset> AssetClass, FFlowValidationHookDelegate Hook)
+{
+	if (!AssetClass || !Hook.IsBound())
+	{
+		return;
+	}
+	GetHookRegistry().FindOrAdd(AssetClass).Add(MoveTemp(Hook));
+}
+
+void FFlowGraphValidation::UnregisterHooksForClass(TSubclassOf<UFlowAsset> AssetClass)
+{
+	GetHookRegistry().Remove(AssetClass);
+}
+
+void FFlowGraphValidation::RegisterContextHook(
+	TSubclassOf<UFlowAsset> AssetClass,
+	FFlowContextValidationHookDelegate Hook)
+{
+	if (!AssetClass || !Hook.IsBound())
+	{
+		return;
+	}
+	GetContextHookRegistry().FindOrAdd(AssetClass).Add(MoveTemp(Hook));
+}
+
+void FFlowGraphValidation::UnregisterContextHooksForClass(TSubclassOf<UFlowAsset> AssetClass)
+{
+	GetContextHookRegistry().Remove(AssetClass);
+}
+
+void FFlowGraphValidation::ValidateAddOnsRecursive(
+	const UFlowAsset* TargetAsset,
+	const UClass* OwnerClass,
+	const FGuid& OwnerNodeGuid,
+	const TArray<FFlowGraphParsedNodeAddOn>& ParsedAddOns,
+	TArray<FFlowValidationFinding>& OutFindings)
+{
+	// GUID uniqueness is scoped per owner: two sibling addons sharing a GUID is an error;
+	// the same GUID under a different owner is fine.
+	TSet<FGuid> SeenAddOnGuids;
+
+	for (const FFlowGraphParsedNodeAddOn& ParsedAddOn : ParsedAddOns)
+	{
+		if (ParsedAddOn.bIsDeleteMarker)
+		{
+			// A deletion can't violate palette/class/attachment rules.
+			continue;
+		}
+
+		if (ParsedAddOn.AddOnGuid.IsValid())
+		{
+			bool bAlreadySeen = false;
+			SeenAddOnGuids.Add(ParsedAddOn.AddOnGuid, &bAlreadySeen);
+			if (bAlreadySeen)
+			{
+				AddFinding(OutFindings, EFlowValidationSeverity::Error, TEXT("DuplicateAddOnGuid"),
+					FString::Printf(TEXT("Duplicate AddOn GUID under the same owner node: %s"), *ParsedAddOn.AddOnGuid.ToString()),
+					OwnerNodeGuid, ParsedAddOn.AddOnGuid);
+			}
+		}
+
+		// An existing addon update may omit Type because its live class is already authoritative.
+		// New aliases are required to provide Type by converter validation, so an empty type here is
+		// unambiguously a merge update and should not be treated as an unresolved class.
+		if (ParsedAddOn.AddOnType.IsEmpty())
+		{
+			continue;
+		}
+
+		// Resolve without the placement check so this validator can name the real defect. The
+		// fail-closed ResolveNodeClass returns nullptr for a non-Flow Blueprint class, which would
+		// otherwise surface as ClassNotResolved - telling the author the type does not exist, when in
+		// fact it exists and merely needs recreating through the right factory.
+		UClass* AddOnClass = UFlowGraphImporter::ResolveNodeClassForQuery(ParsedAddOn.AddOnType);
+
+		FString AddOnNonFlowBlueprintReason;
+		if (UFlowGraphImporter::IsClassFromNonFlowBlueprint(AddOnClass, AddOnNonFlowBlueprintReason))
+		{
+			AddFinding(OutFindings, EFlowValidationSeverity::Error, TEXT("ClassFromNonFlowBlueprint"),
+				AddOnNonFlowBlueprintReason,
+				OwnerNodeGuid, ParsedAddOn.AddOnGuid);
+			continue;
+		}
+
+		if (!AddOnClass || !AddOnClass->IsChildOf(UFlowNodeAddOn::StaticClass()))
+		{
+			AddFinding(OutFindings, EFlowValidationSeverity::Error, TEXT("ClassNotResolved"),
+				FString::Printf(TEXT("AddOn class does not resolve to a UFlowNodeAddOn: '%s'"), *ParsedAddOn.AddOnType),
+				OwnerNodeGuid, ParsedAddOn.AddOnGuid);
+			// Can't do palette/recursion without a resolved class.
+			continue;
+		}
+
+		// Surface abstract classes as a clean dry-run finding
+		// instead of letting them reach NewObject and crash the editor session.
+		if (AddOnClass->HasAnyClassFlags(CLASS_Abstract))
+		{
+			AddFinding(OutFindings, EFlowValidationSeverity::Error, TEXT("ClassIsAbstract"),
+				FString::Printf(TEXT("AddOn class is abstract and cannot be instantiated: '%s'"), *ParsedAddOn.AddOnType),
+				OwnerNodeGuid, ParsedAddOn.AddOnGuid);
+			continue;
+		}
+
+		if (TargetAsset && !TargetAsset->IsNodeOrAddOnClassAllowed(AddOnClass))
+		{
+			AddFinding(OutFindings, EFlowValidationSeverity::Error, TEXT("ClassNotAllowed"),
+				FString::Printf(TEXT("AddOn class '%s' is not allowed in asset class '%s'"),
+					*AddOnClass->GetName(), *TargetAsset->GetClass()->GetName()),
+				OwnerNodeGuid, ParsedAddOn.AddOnGuid);
+		}
+
+		// Attachment eligibility check. OwnerClass is null when a merge-update block omits Type: -
+		// skip in that case, as the addon attaches to the real existing node unchanged.
+		// CheckAcceptFlowNodeAddOnChild is queried on class-default objects. Only Reject fails;
+		// Undetermined/TentativeAccept both pass.
+		if (OwnerClass)
+		{
+			const UFlowNodeBase* ParentCDO = OwnerClass->GetDefaultObject<UFlowNodeBase>();
+			const UFlowNodeAddOn* AddOnCDO = AddOnClass->GetDefaultObject<UFlowNodeAddOn>();
+			if (ParentCDO && AddOnCDO)
+			{
+				const EFlowAddOnAcceptResult AcceptResult =
+					ParentCDO->CheckAcceptFlowNodeAddOnChild(AddOnCDO, TArray<UFlowNodeAddOn*>());
+				if (AcceptResult == EFlowAddOnAcceptResult::Reject)
+				{
+					AddFinding(OutFindings, EFlowValidationSeverity::Error, TEXT("AddonNotAttachable"),
+						FString::Printf(TEXT("AddOn '%s' cannot attach to '%s' (attachment rejected)"),
+							*AddOnClass->GetName(), *OwnerClass->GetName()),
+						OwnerNodeGuid, ParsedAddOn.AddOnGuid);
+				}
+			}
+		}
+
+		// Recurse into addon-of-addon children, scoping GUID uniqueness to that owner.
+		ValidateAddOnsRecursive(TargetAsset, AddOnClass, OwnerNodeGuid, ParsedAddOn.AddOns, OutFindings);
+	}
+}
+
+void FFlowGraphValidation::AddFinding(
+	TArray<FFlowValidationFinding>& OutFindings,
+	EFlowValidationSeverity Severity,
+	const FString& Code,
+	const FString& Message,
+	const FGuid& NodeGuid,
+	const FGuid& AddOnGuid,
+	FName PinName)
+{
+	FFlowValidationFinding& Finding = OutFindings.AddDefaulted_GetRef();
+	Finding.Severity = Severity;
+	Finding.Code = Code;
+	Finding.Message = Message;
+	Finding.NodeGuid = NodeGuid;
+	Finding.AddOnGuid = AddOnGuid;
+	Finding.PinName = PinName;
 }
 
 bool FFlowGraphValidation::DoesNodeHavePin(
@@ -280,231 +505,6 @@ FName FFlowGraphValidation::GetConnectionPinType(
 	}
 
 	return NAME_None;
-}
-
-bool FFlowGraphValidation::HasNoErrors(const TArray<FFlowValidationFinding>& Findings)
-{
-	for (const FFlowValidationFinding& Finding : Findings)
-	{
-		if (Finding.Severity == EFlowValidationSeverity::Error)
-		{
-			return false;
-		}
-	}
-	return true;
-}
-
-bool FFlowGraphValidation::DoesRuntimePinSchemaMatchProjected(
-	const UFlowAsset* FlowAsset,
-	const FFlowProjectedPinSchema& ProjectedPinSchema,
-	FString& OutErrorMessage)
-{
-	OutErrorMessage.Reset();
-	if (!IsValid(FlowAsset))
-	{
-		OutErrorMessage = TEXT("Cannot compare projected pins because the FlowAsset is invalid");
-		return false;
-	}
-
-	// Rebuild the same active set used by pin assembly. Editor orphan pins are not runtime endpoints.
-	const auto BuildActivePins = [](const TArray<FFlowPin>& StaticPins, const TArray<FFlowPin>& ContextPins)
-	{
-		TArray<FFlowPin> ActivePins = StaticPins;
-		for (const FFlowPin& ContextPin : ContextPins)
-		{
-			if (!ContextPin.PinName.IsNone() && !HasPinNamed(ActivePins, ContextPin.PinName))
-			{
-				ActivePins.Add(ContextPin);
-			}
-		}
-		return ActivePins;
-	};
-
-	// Compare ordered pin identity, category, and subcategory so commit cannot wire against a schema
-	// different from the one accepted during preflight.
-	const auto DoPinListsMatch = [](const TArray<FFlowPin>& ActualPins, const TArray<FFlowPin>& ExpectedPins)
-	{
-		if (ActualPins.Num() != ExpectedPins.Num())
-		{
-			return false;
-		}
-
-		for (int32 PinIndex = 0; PinIndex < ActualPins.Num(); ++PinIndex)
-		{
-			const FFlowPin& ActualPin = ActualPins[PinIndex];
-			const FFlowPin& ExpectedPin = ExpectedPins[PinIndex];
-			if (ActualPin.PinName != ExpectedPin.PinName ||
-				ActualPin.GetPinTypeName().Name != ExpectedPin.GetPinTypeName().Name ||
-				ActualPin.GetPinSubCategoryObject().Get() != ExpectedPin.GetPinSubCategoryObject().Get())
-			{
-				return false;
-			}
-		}
-
-		return true;
-	};
-
-	// Verify every surviving node before the importer installs any requested connections.
-	for (const TPair<FGuid, FFlowProjectedPinSet>& ProjectedPair : ProjectedPinSchema)
-	{
-		const UFlowNode* const Node = FlowAsset->GetNode(ProjectedPair.Key);
-		if (!IsValid(Node))
-		{
-			OutErrorMessage = FString::Printf(TEXT("Projected node %s is missing before connection setup"),
-				*ProjectedPair.Key.ToString());
-			return false;
-		}
-
-		const TArray<FFlowPin> ActualInputs = BuildActivePins(Node->GetInputPins(), Node->GetContextInputs());
-		const TArray<FFlowPin> ActualOutputs = BuildActivePins(Node->GetOutputPins(), Node->GetContextOutputs());
-		if (!DoPinListsMatch(ActualInputs, ProjectedPair.Value.InputPins) ||
-			!DoPinListsMatch(ActualOutputs, ProjectedPair.Value.OutputPins))
-		{
-			OutErrorMessage = FString::Printf(TEXT("Active pins on node %s differ from the schema validated by FlowAgent"),
-				*ProjectedPair.Key.ToString());
-			return false;
-		}
-	}
-
-	return true;
-}
-
-void FFlowGraphValidation::ValidateAddOnsRecursive(
-	const UFlowAsset* TargetAsset,
-	const UClass* OwnerClass,
-	const FGuid& OwnerNodeGuid,
-	const TArray<FFlowGraphParsedNodeAddOn>& ParsedAddOns,
-	TArray<FFlowValidationFinding>& OutFindings)
-{
-	// GUID uniqueness is scoped per owner: two sibling addons sharing a GUID is an error;
-	// the same GUID under a different owner is fine.
-	TSet<FGuid> SeenAddOnGuids;
-
-	for (const FFlowGraphParsedNodeAddOn& ParsedAddOn : ParsedAddOns)
-	{
-		if (ParsedAddOn.bIsDeleteMarker)
-		{
-			// A deletion can't violate palette/class/attachment rules.
-			continue;
-		}
-
-		if (ParsedAddOn.AddOnGuid.IsValid())
-		{
-			bool bAlreadySeen = false;
-			SeenAddOnGuids.Add(ParsedAddOn.AddOnGuid, &bAlreadySeen);
-			if (bAlreadySeen)
-			{
-				AddFinding(OutFindings, EFlowValidationSeverity::Error, TEXT("DuplicateAddOnGuid"),
-					FString::Printf(TEXT("Duplicate AddOn GUID under the same owner node: %s"), *ParsedAddOn.AddOnGuid.ToString()),
-					OwnerNodeGuid, ParsedAddOn.AddOnGuid);
-			}
-		}
-
-		// An existing addon update may omit Type because its live class is already authoritative.
-		// New aliases are required to provide Type by converter validation, so an empty type here is
-		// unambiguously a merge update and should not be treated as an unresolved class.
-		if (ParsedAddOn.AddOnType.IsEmpty())
-		{
-			continue;
-		}
-
-		// Resolve without the placement check so this validator can name the real defect. The
-		// fail-closed ResolveNodeClass returns nullptr for a non-Flow Blueprint class, which would
-		// otherwise surface as ClassNotResolved - telling the author the type does not exist, when in
-		// fact it exists and merely needs recreating through the right factory.
-		UClass* AddOnClass = UFlowGraphImporter::ResolveNodeClassForQuery(ParsedAddOn.AddOnType);
-
-		FString AddOnNonFlowBlueprintReason;
-		if (UFlowGraphImporter::IsClassFromNonFlowBlueprint(AddOnClass, AddOnNonFlowBlueprintReason))
-		{
-			AddFinding(OutFindings, EFlowValidationSeverity::Error, TEXT("ClassFromNonFlowBlueprint"),
-				AddOnNonFlowBlueprintReason,
-				OwnerNodeGuid, ParsedAddOn.AddOnGuid);
-			continue;
-		}
-
-		if (!AddOnClass || !AddOnClass->IsChildOf(UFlowNodeAddOn::StaticClass()))
-		{
-			AddFinding(OutFindings, EFlowValidationSeverity::Error, TEXT("ClassNotResolved"),
-				FString::Printf(TEXT("AddOn class does not resolve to a UFlowNodeAddOn: '%s'"), *ParsedAddOn.AddOnType),
-				OwnerNodeGuid, ParsedAddOn.AddOnGuid);
-			// Can't do palette/recursion without a resolved class.
-			continue;
-		}
-
-		// Surface abstract classes as a clean dry-run finding
-		// instead of letting them reach NewObject and crash the editor session.
-		if (AddOnClass->HasAnyClassFlags(CLASS_Abstract))
-		{
-			AddFinding(OutFindings, EFlowValidationSeverity::Error, TEXT("ClassIsAbstract"),
-				FString::Printf(TEXT("AddOn class is abstract and cannot be instantiated: '%s'"), *ParsedAddOn.AddOnType),
-				OwnerNodeGuid, ParsedAddOn.AddOnGuid);
-			continue;
-		}
-
-		if (TargetAsset && !TargetAsset->IsNodeOrAddOnClassAllowed(AddOnClass))
-		{
-			AddFinding(OutFindings, EFlowValidationSeverity::Error, TEXT("ClassNotAllowed"),
-				FString::Printf(TEXT("AddOn class '%s' is not allowed in asset class '%s'"),
-					*AddOnClass->GetName(), *TargetAsset->GetClass()->GetName()),
-				OwnerNodeGuid, ParsedAddOn.AddOnGuid);
-		}
-
-		// Attachment eligibility check. OwnerClass is null when a merge-update block omits Type: -
-		// skip in that case, as the addon attaches to the real existing node unchanged.
-		// CheckAcceptFlowNodeAddOnChild is queried on class-default objects. Only Reject fails;
-		// Undetermined/TentativeAccept both pass.
-		if (OwnerClass)
-		{
-			const UFlowNodeBase* ParentCDO = OwnerClass->GetDefaultObject<UFlowNodeBase>();
-			const UFlowNodeAddOn* AddOnCDO = AddOnClass->GetDefaultObject<UFlowNodeAddOn>();
-			if (ParentCDO && AddOnCDO)
-			{
-				const EFlowAddOnAcceptResult AcceptResult =
-					ParentCDO->CheckAcceptFlowNodeAddOnChild(AddOnCDO, TArray<UFlowNodeAddOn*>());
-				if (AcceptResult == EFlowAddOnAcceptResult::Reject)
-				{
-					AddFinding(OutFindings, EFlowValidationSeverity::Error, TEXT("AddonNotAttachable"),
-						FString::Printf(TEXT("AddOn '%s' cannot attach to '%s' (attachment rejected)"),
-							*AddOnClass->GetName(), *OwnerClass->GetName()),
-						OwnerNodeGuid, ParsedAddOn.AddOnGuid);
-				}
-			}
-		}
-
-		// Recurse into addon-of-addon children, scoping GUID uniqueness to that owner.
-		ValidateAddOnsRecursive(TargetAsset, AddOnClass, OwnerNodeGuid, ParsedAddOn.AddOns, OutFindings);
-	}
-}
-
-bool FFlowGraphValidation::ValidateDocument(
-	const UFlowAsset* TargetAsset,
-	const TArray<FFlowGraphParsedNode>& ParsedNodes,
-	const TArray<FFlowGraphParsedConnection>& ParsedConnections,
-	TArray<FFlowValidationFinding>& OutFindings,
-	const TSet<FGuid>* PostPlanNodeGuids,
-	const FFlowProjectedPinSchema* ProjectedPinSchema,
-	const FFlowValidationContext* ValidationContext)
-{
-	// Validate structure first, then connection endpoints and types against the projected pin schema.
-	ValidateNodes(TargetAsset, ParsedNodes, OutFindings);
-	ValidateConnections(TargetAsset, ParsedNodes, ParsedConnections, OutFindings, PostPlanNodeGuids, ProjectedPinSchema);
-	FFlowValidationContext DefaultValidationContext;
-	if (!ValidationContext)
-	{
-		DefaultValidationContext.TargetAsset = TargetAsset;
-		DefaultValidationContext.EffectiveAsset = TargetAsset;
-		DefaultValidationContext.ResolvedAssetClass = IsValid(TargetAsset) ? TargetAsset->GetClass() : nullptr;
-		ValidationContext = &DefaultValidationContext;
-	}
-
-	RunContextValidationHooks(*ValidationContext, ParsedNodes, ParsedConnections, OutFindings);
-	const UFlowAsset* LegacyHookTarget = IsValid(ValidationContext->TargetAsset)
-		? ValidationContext->TargetAsset
-		: TargetAsset;
-	RunValidationHooks(LegacyHookTarget, ParsedNodes, ParsedConnections, OutFindings);
-
-	return HasNoErrors(OutFindings);
 }
 
 void FFlowGraphValidation::ValidateNodes(

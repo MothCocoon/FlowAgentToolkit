@@ -259,6 +259,400 @@ static void CollectExistingConnections(
 	}
 }
 
+TSharedPtr<FFlowReconcileExecutionPlan> FFlowGraphReconciler::ComputeReconcilePlan(
+	const FString& TargetAssetPath,
+	const FString& FlowAgentDocumentJson,
+	FString& OutErrorMessage)
+{
+	OutErrorMessage.Empty();
+
+	if (FlowAgentDocumentJson.IsEmpty())
+	{
+		OutErrorMessage = TEXT("FlowAgent document is empty");
+		return nullptr;
+	}
+
+	TSharedPtr<FFlowReconcileExecutionPlan> Plan = MakeShared<FFlowReconcileExecutionPlan>();
+	Plan->InputSizeBytes = FlowAgentDocumentJson.Len();
+
+	// Hard failure only for a document too malformed to reason about at all (bad JSON, wrong
+	// formatVersion). Every other problem the converter finds (identity ambiguity, bad GUIDs,
+	// unresolved aliases, field legality) is appended to ValidationFindings below and handled the
+	// same way a semantic FFlowGraphValidation finding is - as data, never by failing this call.
+	FFlowAgentDocument Document;
+	TArray<FFlowAgentIssue> FlowAgentIssues;
+	if (!FFlowAgentConverter::ParseDocument(FlowAgentDocumentJson, Document, FlowAgentIssues, OutErrorMessage))
+	{
+		return nullptr;
+	}
+
+	TArray<FFlowGraphParsedNode> ParsedNodes;
+	TArray<FFlowGraphParsedConnection> ParsedConnections;
+	TArray<FGuid> ScopedNodeGuids;
+	TMap<FString, FGuid> AliasMap;
+	FFlowAgentConverter::ConvertToParsedGraph(Document, ParsedNodes, ParsedConnections, ScopedNodeGuids, AliasMap, FlowAgentIssues);
+
+	AppendFlowAgentIssuesAsFindings(FlowAgentIssues, Plan->ValidationFindings);
+
+	UFlowAsset* ExistingAsset = FindOrLoadFlowAsset(TargetAssetPath);
+	UClass* ResolvedAssetClass = ExistingAsset ? ExistingAsset->GetClass() : UFlowAsset::StaticClass();
+	if (!ExistingAsset && !Document.AssetClass.IsEmpty() && !Document.AssetClass.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+	{
+		UClass* const DocumentAssetClass = LoadObject<UClass>(nullptr, *Document.AssetClass);
+		if (DocumentAssetClass && DocumentAssetClass->IsChildOf(UFlowAsset::StaticClass()))
+		{
+			ResolvedAssetClass = DocumentAssetClass;
+		}
+	}
+	Plan->ResolvedAssetClass = ResolvedAssetClass;
+	StageAssetProperties(Document.AssetProperties, ResolvedAssetClass, ExistingAsset, *Plan);
+
+	// No asset yet: all nodes are adds, no validation possible.
+	if (!ExistingAsset)
+	{
+		if (!ComputePlanForNewAsset(Document.AssetClass, Document.bWorldBound, ParsedNodes, ParsedConnections, *Plan, OutErrorMessage))
+		{
+			return nullptr;
+		}
+		Plan->AliasMap = AliasMap;
+		return Plan;
+	}
+
+	// Asset exists: classify, validate. Aliasing/GUID resolution already happened in ConvertToParsedGraph.
+	Plan->AllParsedNodes = ParsedNodes;
+	Plan->AllParsedConnections = ParsedConnections;
+	Plan->AssetClassPath = Document.AssetClass;
+	Plan->bWorldBound = Document.bWorldBound;
+
+	// Spec section 4: on an existing asset, assetClass must match the real class or it is an
+	// error. An empty assetClass is not a mismatch - it means the document is silent on class,
+	// which is legal on a patch against an asset that already exists.
+	if (!Document.AssetClass.IsEmpty() && !Document.AssetClass.Equals(ExistingAsset->GetClass()->GetPathName(), ESearchCase::CaseSensitive))
+	{
+		FFlowValidationFinding& Finding = Plan->ValidationFindings.AddDefaulted_GetRef();
+		Finding.Severity = EFlowValidationSeverity::Error;
+		Finding.Code = TEXT("ClassMismatch");
+		Finding.Message = FString::Printf(TEXT("[ClassMismatch] document assetClass '%s' does not match existing asset class '%s'"), *Document.AssetClass, *ExistingAsset->GetClass()->GetPathName());
+	}
+
+	const TMap<FGuid, UFlowNode*>& CurrentNodes = ExistingAsset->GetNodes();
+	const int32 TotalExistingBeforeApply = CurrentNodes.Num();
+
+	// Full mode is authoritative over the whole asset: the effective scope is every existing node,
+	// not just ScopedNodeGuids (which the converter forces empty in Full mode - ScopeWithFullMode
+	// is a validation error otherwise). Patch mode keeps the document-declared scope unchanged.
+	TArray<FGuid> EffectiveScopedNodeGuids = ScopedNodeGuids;
+	if (Document.Mode == EFlowAgentMode::Full)
+	{
+		EffectiveScopedNodeGuids.Reset();
+		CurrentNodes.GenerateKeyArray(EffectiveScopedNodeGuids);
+	}
+
+	ClassifyParsedNodes(Plan->AllParsedNodes, EffectiveScopedNodeGuids, CurrentNodes,
+		Plan->NodesToAdd, Plan->NodesToUpdate, Plan->NodesToDelete, Plan->AliasMap);
+
+	// The converter's alias map is authoritative because ClassifyParsedNodes tracks node aliases only.
+	Plan->AliasMap = AliasMap;
+
+	Plan->Plan.NodesDeleted = Plan->NodesToDelete;
+	for (const FFlowGraphParsedNode& NodeToAdd : Plan->NodesToAdd)
+	{
+		Plan->Plan.NodesAdded.Add(NodeToAdd.NodeGuid);
+	}
+	for (const FFlowGraphParsedNode& NodeToUpdate : Plan->NodesToUpdate)
+	{
+		Plan->Plan.NodesUpdated.Add(NodeToUpdate.NodeGuid);
+	}
+
+	// Full mode also implicitly removes any existing connection the document doesn't re-declare.
+	// Appended as synthetic delete markers so ClassifyParsedConnections' existing idempotency
+	// check (only report a removal if the connection is actually present) applies unchanged.
+	if (Document.Mode == EFlowAgentMode::Full)
+	{
+		TArray<FFlowGraphParsedConnection> ExistingConnections;
+		CollectExistingConnections(CurrentNodes, ExistingConnections);
+
+		TSet<FString> DeclaredConnectionKeys;
+		DeclaredConnectionKeys.Reserve(Plan->AllParsedConnections.Num());
+		for (const FFlowGraphParsedConnection& ParsedConnection : Plan->AllParsedConnections)
+		{
+			if (!ParsedConnection.bIsDeleteMarker)
+			{
+				DeclaredConnectionKeys.Add(FString::Printf(TEXT("%s.%s -> %s.%s"),
+					*ParsedConnection.SourceNodeGuid.ToString(), *ParsedConnection.SourcePinName.ToString(),
+					*ParsedConnection.TargetNodeGuid.ToString(), *ParsedConnection.TargetPinName.ToString()));
+			}
+		}
+
+		for (const FFlowGraphParsedConnection& ExistingConnection : ExistingConnections)
+		{
+			const FString Key = FString::Printf(TEXT("%s.%s -> %s.%s"),
+				*ExistingConnection.SourceNodeGuid.ToString(), *ExistingConnection.SourcePinName.ToString(),
+				*ExistingConnection.TargetNodeGuid.ToString(), *ExistingConnection.TargetPinName.ToString());
+			if (!DeclaredConnectionKeys.Contains(Key))
+			{
+				FFlowGraphParsedConnection& DeleteMarker = Plan->AllParsedConnections.Add_GetRef(ExistingConnection);
+				DeleteMarker.bIsDeleteMarker = true;
+			}
+		}
+	}
+
+	ClassifyParsedConnections(Plan->AllParsedConnections, CurrentNodes,
+		Plan->ConnectionsToAdd, Plan->ConnectionsToRemove, Plan->Plan);
+
+	Plan->NodesTouched = Plan->NodesToAdd.Num() + Plan->NodesToUpdate.Num() + Plan->NodesToDelete.Num();
+	Plan->NodesPreserved = TotalExistingBeforeApply - (Plan->NodesToUpdate.Num() + Plan->NodesToDelete.Num());
+
+	// Pre-commit validation on the fully-resolved document and its isolated final pin schema.
+	const TSet<FGuid> PostPlanNodeGuids = BuildPostPlanNodeSet(CurrentNodes, Plan->NodesToAdd, Plan->NodesToDelete);
+	FString PreviewError;
+	if (!BuildEffectivePinSchema(
+		ExistingAsset, *Plan, Plan->ProjectedPinSchema, PreviewError, &Plan->EffectiveStateAsset))
+	{
+		FFlowValidationFinding& Finding = Plan->ValidationFindings.AddDefaulted_GetRef();
+		Finding.Severity = EFlowValidationSeverity::Error;
+		Finding.Code = TEXT("PinSchemaPreviewFailed");
+		Finding.Message = PreviewError;
+	}
+	FFlowValidationContext ValidationContext;
+	ValidationContext.TargetAsset = ExistingAsset;
+	ValidationContext.EffectiveAsset = Plan->EffectiveStateAsset.Get();
+	ValidationContext.ResolvedAssetClass = ResolvedAssetClass;
+	ValidationContext.StagedAssetProperties = &Plan->StagedAssetProperties;
+	const UFlowAsset* ValidationAsset = Plan->EffectiveStateAsset.IsValid()
+		? Plan->EffectiveStateAsset.Get()
+		: ExistingAsset;
+	FFlowGraphValidation::ValidateDocument(ValidationAsset, Plan->AllParsedNodes,
+		Plan->AllParsedConnections, Plan->ValidationFindings, &PostPlanNodeGuids,
+		&Plan->ProjectedPinSchema, &ValidationContext);
+
+	return Plan;
+}
+
+FFlowReconcileResult FFlowGraphReconciler::ExecuteReconcilePlan(
+	const FFlowReconcileExecutionPlan& ExecutionPlan,
+	const FString& TargetAssetPath,
+	FString& OutErrorMessage)
+{
+	FFlowReconcileResult Result;
+	OutErrorMessage.Empty();
+
+	Result.Plan = ExecutionPlan.Plan;
+	Result.AliasMap = ExecutionPlan.AliasMap;
+	Result.ValidationFindings = ExecutionPlan.ValidationFindings;
+	Result.NodesTouched = ExecutionPlan.NodesTouched;
+	Result.NodesPreserved = ExecutionPlan.NodesPreserved;
+	Result.InputSizeBytes = ExecutionPlan.InputSizeBytes;
+
+	// Refuse to apply if validation found any blocking errors.
+	const bool bHasBlockingError = ExecutionPlan.ValidationFindings.ContainsByPredicate(
+		[](const FFlowValidationFinding& F) { return F.Severity == EFlowValidationSeverity::Error; });
+
+	if (bHasBlockingError)
+	{
+		OutErrorMessage = TEXT("Validation failed - see ValidationFindings; the asset was not modified");
+		Result.Findings.Add(OutErrorMessage);
+		return Result;
+	}
+
+	if (ExecutionPlan.bIsNewAsset)
+	{
+		if (ExecutePlanForNewAsset(ExecutionPlan, TargetAssetPath, Result, OutErrorMessage))
+		{
+			Result.bSuccess = true;
+		}
+		return Result;
+	}
+
+	UFlowAsset* ExistingAsset = FindOrLoadFlowAsset(TargetAssetPath);
+	if (!ExistingAsset)
+	{
+		OutErrorMessage = FString::Printf(TEXT("Asset no longer exists at %s; cannot apply plan"), *TargetAssetPath);
+		Result.Findings.Add(OutErrorMessage);
+		return Result;
+	}
+
+	if (ApplyPlanToExistingAsset(ExistingAsset, ExecutionPlan, Result, OutErrorMessage))
+	{
+		Result.bSuccess = true;
+	}
+
+	return Result;
+}
+
+bool FFlowGraphReconciler::FindOrCreateNode(
+	const FString& TargetAssetPath,
+	const FString& NodeType,
+	const TMap<FString, FString>& MatchProperties,
+	bool bDryRun,
+	FGuid& OutNodeGuid,
+	bool& OutCreated,
+	FString& OutErrorMessage)
+{
+	OutNodeGuid.Invalidate();
+	OutCreated = false;
+
+	UClass* ResolvedClass = UFlowGraphImporter::ResolveNodeClass(NodeType);
+	if (!ResolvedClass)
+	{
+		OutErrorMessage = FString::Printf(TEXT("FindOrCreateNode: could not resolve NodeType: %s"), *NodeType);
+		return false;
+	}
+
+	// RS13: an unknown property name is a hard error, checked once against the class up front -
+	// independent of whether any node instance exists yet to compare against. Each raw value is
+	// also normalized here (parse -> re-stringify through the same path the create path uses) so
+	// the match comparison below compares canonical forms on both sides - otherwise a caller
+	// passing e.g. "123" for a float property would never match a node created from "123.0".
+	TArray<FProperty*> MatchFProperties;
+	TArray<FString> NormalizedMatchValues;
+	MatchFProperties.Reserve(MatchProperties.Num());
+	NormalizedMatchValues.Reserve(MatchProperties.Num());
+	for (const TPair<FString, FString>& Pair : MatchProperties)
+	{
+		FProperty* Property = ResolvedClass->FindPropertyByName(FName(*Pair.Key));
+		if (!Property)
+		{
+			OutErrorMessage = FString::Printf(TEXT("FindOrCreateNode: %s has no property named '%s'"), *ResolvedClass->GetName(), *Pair.Key);
+			return false;
+		}
+
+		FString NormalizedValue;
+		FString NormalizeError;
+		if (!NormalizePropertyValueString(Property, Pair.Value, NormalizedValue, NormalizeError))
+		{
+			OutErrorMessage = FString::Printf(TEXT("FindOrCreateNode: %s"), *NormalizeError);
+			return false;
+		}
+
+		MatchFProperties.Add(Property);
+		NormalizedMatchValues.Add(NormalizedValue);
+	}
+
+	UFlowAsset* ExistingAsset = FindOrLoadFlowAsset(TargetAssetPath);
+	if (!ExistingAsset)
+	{
+		OutErrorMessage = FString::Printf(TEXT("FindOrCreateNode: no existing asset at %s (this helper does not create the asset itself)"), *TargetAssetPath);
+		return false;
+	}
+
+	// Exact-class match only (not IsA) - a subclass is a different type as far as this helper is
+	// concerned, matching RS13's exact-equality philosophy applied to identity as well as values.
+	TArray<FGuid> MatchingGuids;
+	for (const TPair<FGuid, UFlowNode*>& NodePair : ExistingAsset->GetNodes())
+	{
+		UFlowNode* Node = NodePair.Value;
+		if (!Node || Node->GetClass() != ResolvedClass)
+		{
+			continue;
+		}
+
+		bool bAllMatch = true;
+		for (int32 PropIndex = 0; PropIndex < MatchFProperties.Num(); ++PropIndex)
+		{
+			FProperty* Property = MatchFProperties[PropIndex];
+			const void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Node);
+			const FString CurrentValue = UFlowGraphExporter::GetPropertyValueAsString(Property, ValuePtr);
+			if (CurrentValue != NormalizedMatchValues[PropIndex])
+			{
+				bAllMatch = false;
+				break;
+			}
+		}
+
+		if (bAllMatch)
+		{
+			MatchingGuids.Add(NodePair.Key);
+		}
+	}
+
+	if (!MatchingGuids.IsEmpty())
+	{
+		// Deterministic tiebreak (RS13): lowest FGuid::ToString() wins, same convention the
+		// exporter already uses for stable ordering - never an ambiguity error, so a repeated
+		// idempotent call never starts failing just because an unrelated later change added a
+		// second coincidentally-matching node.
+		MatchingGuids.Sort([](const FGuid& A, const FGuid& B) { return A.ToString() < B.ToString(); });
+		OutNodeGuid = MatchingGuids[0];
+		OutCreated = false;
+		return true;
+	}
+
+	// No match: create exactly one new node via the same ComputeReconcilePlan/ExecuteReconcilePlan
+	// pipeline apply_flow_patch uses, so the same pre-commit validation, auto-placement, and
+	// regraph apply - never a hand-rolled parallel creation path.
+	static const FString NewNodeAlias = TEXT("findorcreate");
+
+	TSharedRef<FJsonObject> PropertiesObject = MakeShared<FJsonObject>();
+	for (const TPair<FString, FString>& Pair : MatchProperties)
+	{
+		PropertiesObject->SetStringField(Pair.Key, Pair.Value);
+	}
+
+	TSharedRef<FJsonObject> OpObject = MakeShared<FJsonObject>();
+	OpObject->SetStringField(TEXT("kind"), TEXT("UpsertNode"));
+	OpObject->SetStringField(TEXT("newAlias"), NewNodeAlias);
+	OpObject->SetStringField(TEXT("type"), ResolvedClass->GetPathName());
+	OpObject->SetObjectField(TEXT("properties"), PropertiesObject);
+
+	TArray<TSharedPtr<FJsonValue>> OpsArray;
+	OpsArray.Add(MakeShared<FJsonValueObject>(OpObject));
+
+	const FString ExpectedOwnerClass = ExistingAsset->GetExpectedOwnerClass().ToSoftObjectPath().GetAssetName();
+	TSharedRef<FJsonObject> DocumentObject = MakeShared<FJsonObject>();
+	DocumentObject->SetNumberField(TEXT("formatVersion"), 2);
+	DocumentObject->SetStringField(TEXT("mode"), TEXT("Patch"));
+	DocumentObject->SetStringField(TEXT("assetClass"), ExistingAsset->GetClass()->GetPathName());
+	DocumentObject->SetBoolField(TEXT("bWorldBound"), ExistingAsset->bWorldBound);
+	DocumentObject->SetStringField(TEXT("expectedOwnerClass"), ExpectedOwnerClass);
+	DocumentObject->SetArrayField(TEXT("ops"), OpsArray);
+
+	FString MutationDocumentJson;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&MutationDocumentJson);
+	FJsonSerializer::Serialize(DocumentObject, Writer);
+
+	FString ComputeError;
+	TSharedPtr<FFlowReconcileExecutionPlan> ExecutionPlan = ComputeReconcilePlan(TargetAssetPath, MutationDocumentJson, ComputeError);
+	if (!ExecutionPlan)
+	{
+		OutErrorMessage = ComputeError.IsEmpty() ? TEXT("FindOrCreateNode: failed to compute creation plan") : ComputeError;
+		return false;
+	}
+
+	const FGuid* MintedGuid = ExecutionPlan->AliasMap.Find(NewNodeAlias);
+	if (!MintedGuid)
+	{
+		OutErrorMessage = TEXT("FindOrCreateNode: creation plan did not mint a GUID for the new node");
+		return false;
+	}
+
+	if (bDryRun)
+	{
+		if (!FFlowGraphValidation::HasNoErrors(ExecutionPlan->ValidationFindings))
+		{
+			OutErrorMessage = TEXT("FindOrCreateNode: dry-run plan has blocking validation errors");
+			return false;
+		}
+
+		OutNodeGuid = *MintedGuid;
+		OutCreated = true;
+		return true;
+	}
+
+	FString ExecuteError;
+	FFlowReconcileResult Result = ExecuteReconcilePlan(*ExecutionPlan, TargetAssetPath, ExecuteError);
+	if (!Result.bSuccess)
+	{
+		OutErrorMessage = ExecuteError.IsEmpty() ? TEXT("FindOrCreateNode: failed to execute creation plan") : ExecuteError;
+		return false;
+	}
+
+	const FGuid* ExecutedGuid = Result.AliasMap.Find(NewNodeAlias);
+	OutNodeGuid = ExecutedGuid ? *ExecutedGuid : *MintedGuid;
+	OutCreated = true;
+	return true;
+}
+
 UFlowAsset* FFlowGraphReconciler::FindOrLoadFlowAsset(const FString& TargetAssetPath)
 {
 	// Check for an already-in-memory asset first (e.g. one open and unsaved in the editor, or just
@@ -286,73 +680,6 @@ UFlowAsset* FFlowGraphReconciler::FindOrLoadFlowAsset(const FString& TargetAsset
 	}
 
 	return Found;
-}
-
-// new-asset compute: populates plan summary and execution data from an already-converted
-// document. There is no existing asset to validate class-allowance/attachment rules against, but
-// pin existence and connection endpoints are fully determined by the document itself (every node
-// referenced is either in ParsedNodes or the document is invalid), so ValidateDocument still runs
-// with a null TargetAsset and the full set of added node GUIDs as PostPlanNodeGuids.
-bool FFlowGraphReconciler::ComputePlanForNewAsset(
-	const FString& AssetClassPath,
-	bool bWorldBound,
-	const TArray<FFlowGraphParsedNode>& ParsedNodes,
-	const TArray<FFlowGraphParsedConnection>& ParsedConnections,
-	FFlowReconcileExecutionPlan& OutPlan,
-	FString& OutErrorMessage)
-{
-	OutPlan.AllParsedNodes = ParsedNodes;
-	OutPlan.AllParsedConnections = ParsedConnections;
-	OutPlan.AssetClassPath = AssetClassPath;
-	OutPlan.bWorldBound = bWorldBound;
-
-	for (const FFlowGraphParsedNode& ParsedNode : OutPlan.AllParsedNodes)
-	{
-		if (!ParsedNode.bIsDeleteMarker)
-		{
-			OutPlan.NodesToAdd.Add(ParsedNode);
-			OutPlan.Plan.NodesAdded.Add(ParsedNode.NodeGuid);
-		}
-	}
-
-	// Every connection in the document is new on an asset that does not exist yet. Reporting them
-	// here is what lets a dry-run create say what it would connect; ExecutePlanForNewAsset then
-	// replaces this intent with what actually landed. Without it a create reports adding no
-	// connections while silently making them - a claim contradicted by the asset itself.
-	for (const FFlowGraphParsedConnection& ParsedConnection : OutPlan.AllParsedConnections)
-	{
-		if (!ParsedConnection.bIsDeleteMarker)
-		{
-			OutPlan.Plan.ConnectionsAdded.Add(FString::Printf(TEXT("%s.%s -> %s.%s"),
-				*ParsedConnection.SourceNodeGuid.ToString(), *ParsedConnection.SourcePinName.ToString(),
-				*ParsedConnection.TargetNodeGuid.ToString(), *ParsedConnection.TargetPinName.ToString()));
-		}
-	}
-
-	OutPlan.NodesTouched = OutPlan.Plan.NodesAdded.Num();
-	OutPlan.NodesPreserved = 0;
-	OutPlan.bIsNewAsset = true;
-
-	const TSet<FGuid> PostPlanNodeGuids = BuildPostPlanNodeSet(TMap<FGuid, UFlowNode*>(), OutPlan.NodesToAdd, TArray<FGuid>());
-	// Project new nodes and their AddOn trees before validating same-document generated-pin connections.
-	FString PreviewError;
-	if (!BuildEffectivePinSchema(
-		nullptr, OutPlan, OutPlan.ProjectedPinSchema, PreviewError, &OutPlan.EffectiveStateAsset))
-	{
-		FFlowValidationFinding& Finding = OutPlan.ValidationFindings.AddDefaulted_GetRef();
-		Finding.Severity = EFlowValidationSeverity::Error;
-		Finding.Code = TEXT("PinSchemaPreviewFailed");
-		Finding.Message = PreviewError;
-	}
-	FFlowValidationContext ValidationContext;
-	ValidationContext.EffectiveAsset = OutPlan.EffectiveStateAsset.Get();
-	ValidationContext.ResolvedAssetClass = OutPlan.ResolvedAssetClass;
-	ValidationContext.StagedAssetProperties = &OutPlan.StagedAssetProperties;
-	FFlowGraphValidation::ValidateDocument(OutPlan.EffectiveStateAsset.Get(), OutPlan.AllParsedNodes,
-		OutPlan.AllParsedConnections, OutPlan.ValidationFindings, &PostPlanNodeGuids,
-		&OutPlan.ProjectedPinSchema, &ValidationContext);
-
-	return true;
 }
 
 namespace FlowGraphEffectiveStateDetail
@@ -654,202 +981,6 @@ namespace FlowGraphEffectiveStateDetail
 	}
 }
 
-bool FFlowGraphReconciler::BuildEffectivePinSchema(
-	UFlowAsset* ExistingAsset,
-	const FFlowReconcileExecutionPlan& ExecutionPlan,
-	FFlowProjectedPinSchema& OutProjectedPinSchema,
-	FString& OutErrorMessage,
-	TStrongObjectPtr<UFlowAsset>* OutEffectiveAsset)
-{
-	OutErrorMessage.Reset();
-	OutProjectedPinSchema.Reset();
-
-	// Validation must preview the exact AddOn-generated pins from the requested final state,
-	// because FlowAgent resolves connections before its live mutation begins.
-	FlowGraphEffectiveStateDetail::FFlowEffectivePinSchemaPreview Preview;
-	if (!FlowGraphEffectiveStateDetail::CreatePreviewAsset(
-		ExistingAsset, ExecutionPlan, Preview.Asset, OutErrorMessage))
-	{
-		return false;
-	}
-	if (ExistingAsset)
-	{
-		if (!FFlowAssetPropertyPolicy::CopyRegisteredProperties(ExistingAsset, Preview.Asset.Get(), OutErrorMessage))
-		{
-			return false;
-		}
-	}
-	else
-	{
-		Preview.Asset->bWorldBound = ExecutionPlan.bWorldBound;
-	}
-
-	TArray<FName> StagedPropertyNames;
-	ExecutionPlan.StagedAssetProperties.GenerateKeyArray(StagedPropertyNames);
-	StagedPropertyNames.Sort(FNameLexicalLess());
-	for (const FName PropertyName : StagedPropertyNames)
-	{
-		const FFlowStagedAssetProperty& StagedProperty = ExecutionPlan.StagedAssetProperties.FindChecked(PropertyName);
-		if (StagedProperty.bChanged && !FFlowAssetPropertyPolicy::SetStagedObjectReference(
-			Preview.Asset.Get(), StagedProperty, /*bSendEditNotifications=*/true, OutErrorMessage))
-		{
-			return false;
-		}
-	}
-	FlowGraphEffectiveStateDetail::IndexPreviewPlan(ExecutionPlan, Preview);
-
-	// Build isolated node identity and state first, then attach those nodes to the preview asset map.
-	if (!FlowGraphEffectiveStateDetail::DuplicateExistingNodes(ExistingAsset, Preview, OutErrorMessage) ||
-		!FlowGraphEffectiveStateDetail::InstantiateAddedNodes(ExecutionPlan, Preview, OutErrorMessage) ||
-		!FlowGraphEffectiveStateDetail::RegisterPreviewNodes(Preview, OutErrorMessage))
-	{
-		return false;
-	}
-
-	// Apply node properties and declared pins after preview nodes have their final identity and parent map.
-	for (const FFlowGraphParsedNode& ParsedNode : ExecutionPlan.AllParsedNodes)
-	{
-		if (ParsedNode.bIsDeleteMarker)
-		{
-			continue;
-		}
-
-		UFlowNode* PreviewNode = Preview.Nodes.FindRef(ParsedNode.NodeGuid);
-		if (!IsValid(PreviewNode))
-		{
-			OutErrorMessage = FString::Printf(
-				TEXT("Could not find isolated node preview for %s"), *ParsedNode.NodeGuid.ToString());
-			return false;
-		}
-
-		if (!UFlowGraphImporter::SetNodeProperties(PreviewNode, ParsedNode.Properties, OutErrorMessage))
-		{
-			return false;
-		}
-		PreviewNode->TryUpdateAutoDataPins();
-		UFlowGraphImporter::ApplyDeclaredPins(PreviewNode, ParsedNode);
-	}
-
-	// Apply AddOn edits into a shared notification set so callbacks wait until every tree is complete.
-	FFlowPendingAddOnPropertyChanges PendingPropertyChanges;
-	TArray<FFlowReconcileAddonEntry> PreviewAddOnsAdded;
-	TArray<FFlowReconcileAddonEntry> PreviewAddOnsUpdated;
-	TArray<FFlowReconcileAddonEntry> PreviewAddOnsDeleted;
-	for (const FFlowGraphParsedNode& ParsedNode : ExecutionPlan.AllParsedNodes)
-	{
-		if (ParsedNode.bIsDeleteMarker)
-		{
-			continue;
-		}
-
-		UFlowNode* PreviewNode = Preview.Nodes.FindRef(ParsedNode.NodeGuid);
-		if (Preview.AddedNodeGuids.Contains(ParsedNode.NodeGuid))
-		{
-			if (!UFlowGraphImporter::CreateAddOnsRecursive(
-				PreviewNode, ParsedNode.AddOns, PendingPropertyChanges, OutErrorMessage))
-			{
-				return false;
-			}
-		}
-		else if (!ParsedNode.AddOns.IsEmpty() || ParsedNode.bIsFullBlock)
-		{
-			if (!ReconcileNodeAddOns(PreviewNode, ParsedNode.NodeGuid, ParsedNode.AddOns, PendingPropertyChanges,
-				PreviewAddOnsAdded, PreviewAddOnsUpdated, PreviewAddOnsDeleted, OutErrorMessage, ParsedNode.bIsFullBlock))
-			{
-				return false;
-			}
-		}
-	}
-
-	// Run the same child-before-parent callbacks used during execution, then refresh auto data pins.
-	TArray<UFlowNodeBase*> PreviewRootOwners;
-	PreviewRootOwners.Reserve(Preview.Nodes.Num());
-	for (const TPair<FGuid, UFlowNode*>& PreviewNodePair : Preview.Nodes)
-	{
-		PreviewRootOwners.Add(PreviewNodePair.Value);
-	}
-	if (!UFlowGraphImporter::DispatchPendingAddOnPropertyChanges(
-		PreviewRootOwners, PendingPropertyChanges, OutErrorMessage))
-	{
-		return false;
-	}
-
-	FlowGraphEffectiveStateDetail::RefreshPreviewAutoPins(Preview);
-	if (!FlowGraphEffectiveStateDetail::CollectProjectedPinSchema(
-		ExistingAsset, Preview, OutProjectedPinSchema, OutErrorMessage))
-	{
-		return false;
-	}
-	if (OutEffectiveAsset)
-	{
-		*OutEffectiveAsset = MoveTemp(Preview.Asset);
-	}
-	return true;
-}
-
-// new-asset execute: full import + regraph.
-bool FFlowGraphReconciler::ExecutePlanForNewAsset(
-	const FFlowReconcileExecutionPlan& ExecutionPlan,
-	const FString& TargetAssetPath,
-	FFlowReconcileResult& Result,
-	FString& OutErrorMessage)
-{
-	UFlowAsset* CreatedAsset = UFlowGraphImporter::ImportFlowGraphFromDocument(
-		TargetAssetPath,
-		ExecutionPlan.AssetClassPath,
-		ExecutionPlan.bWorldBound,
-		ExecutionPlan.AllParsedNodes,
-		ExecutionPlan.AllParsedConnections,
-		OutErrorMessage,
-		&ExecutionPlan.ProjectedPinSchema,
-		&ExecutionPlan.StagedAssetProperties);
-	if (!CreatedAsset)
-	{
-		Result.Findings.Add(OutErrorMessage);
-		return false;
-	}
-
-	// Extract positions from the already-parsed node list (same as ApplyPlanToExistingAsset does)
-	// so aliased nodes keep the GUIDs already minted by the converter.
-	TMap<FGuid, FIntPoint> NodePositions;
-	for (const FFlowGraphParsedNode& ParsedNode : ExecutionPlan.AllParsedNodes)
-	{
-		if (ParsedNode.bHasPos && !ParsedNode.bIsDeleteMarker)
-		{
-			NodePositions.Add(ParsedNode.NodeGuid, ParsedNode.Pos);
-		}
-	}
-	if (!UFlowGraphRegrapher::RegraphFlowAsset(CreatedAsset, NodePositions))
-	{
-		OutErrorMessage = TEXT("Created the asset but failed to regraph it");
-		Result.Findings.Add(OutErrorMessage);
-		return false;
-	}
-
-	// Hold the create path to the same standard as the patch path: report what the asset shows, not
-	// what the import was asked to do. ImportFlowGraphFromDocument succeeding is not evidence that
-	// every connection took.
-	TArray<FFlowGraphParsedConnection> ExpectedConnections;
-	ExpectedConnections.Reserve(ExecutionPlan.AllParsedConnections.Num());
-	for (const FFlowGraphParsedConnection& ParsedConnection : ExecutionPlan.AllParsedConnections)
-	{
-		if (!ParsedConnection.bIsDeleteMarker)
-		{
-			ExpectedConnections.Add(ParsedConnection);
-		}
-	}
-
-	TArray<FString> VerifiedConnectionsAdded, NotLandedConnections;
-	FFlowGraphReconciler::VerifyConnectionsLanded(CreatedAsset, ExpectedConnections, VerifiedConnectionsAdded, NotLandedConnections);
-	for (const FString& NotLandedLabel : NotLandedConnections)
-	{
-		Result.Findings.Add(FString::Printf(TEXT("Requested connection did not land: %s"), *NotLandedLabel));
-	}
-	Result.Plan.ConnectionsAdded = MoveTemp(VerifiedConnectionsAdded);
-
-	return true;
-}
-
 void FFlowGraphReconciler::VerifyConnectionsLanded(
 	UFlowAsset* FlowAsset,
 	const TArray<FFlowGraphParsedConnection>& ExpectedConnections,
@@ -899,132 +1030,6 @@ void FFlowGraphReconciler::VerifyConnectionsLanded(
 		else
 		{
 			OutNotLanded.Add(ConnectionLabel);
-		}
-	}
-}
-
-void FFlowGraphReconciler::ClassifyParsedNodes(
-	const TArray<FFlowGraphParsedNode>& ParsedNodes,
-	const TArray<FGuid>& ScopedNodeGuids,
-	const TMap<FGuid, UFlowNode*>& CurrentNodes,
-	TArray<FFlowGraphParsedNode>& OutNodesToAdd,
-	TArray<FFlowGraphParsedNode>& OutNodesToUpdate,
-	TArray<FGuid>& OutNodesToDelete,
-	TMap<FString, FGuid>& OutAliasMap)
-{
-	for (const FFlowGraphParsedNode& ParsedNode : ParsedNodes)
-	{
-		if (ParsedNode.bIsDeleteMarker)
-		{
-			if (CurrentNodes.Contains(ParsedNode.NodeGuid))
-			{
-				OutNodesToDelete.Add(ParsedNode.NodeGuid);
-			}
-			continue;
-		}
-
-		if (ParsedNode.bIsNewAlias || !CurrentNodes.Contains(ParsedNode.NodeGuid))
-		{
-			OutNodesToAdd.Add(ParsedNode);
-			if (ParsedNode.bIsNewAlias && !ParsedNode.Alias.IsEmpty())
-			{
-				OutAliasMap.Add(ParsedNode.Alias, ParsedNode.NodeGuid);
-			}
-		}
-		else
-		{
-			OutNodesToUpdate.Add(ParsedNode);
-		}
-	}
-
-	// A node named in scope but absent from this document's [NODES] section is treated as an
-	// implicit delete, as if "-Node: <Guid>" had been written. A node not named in scope is
-	// never affected by this loop - unscoped omission means "untouched".
-	// Build the upsert set once so the per-scope-entry lookup is O(1), not O(ParsedNodes).
-	TSet<FGuid> UpsertedGuids;
-	UpsertedGuids.Reserve(ParsedNodes.Num());
-	for (const FFlowGraphParsedNode& ParsedNode : ParsedNodes)
-	{
-		if (!ParsedNode.bIsDeleteMarker)
-		{
-			UpsertedGuids.Add(ParsedNode.NodeGuid);
-		}
-	}
-
-	for (const FGuid& ScopedGuid : ScopedNodeGuids)
-	{
-		if (!CurrentNodes.Contains(ScopedGuid) || OutNodesToDelete.Contains(ScopedGuid))
-		{
-			continue;
-		}
-
-		if (!UpsertedGuids.Contains(ScopedGuid))
-		{
-			OutNodesToDelete.Add(ScopedGuid);
-		}
-	}
-}
-
-void FFlowGraphReconciler::ClassifyParsedConnections(
-	const TArray<FFlowGraphParsedConnection>& ParsedConnections,
-	const TMap<FGuid, UFlowNode*>& CurrentNodes,
-	TArray<FFlowGraphParsedConnection>& OutConnectionsToAdd,
-	TArray<FFlowGraphParsedConnection>& OutConnectionsToRemove,
-	FFlowReconcilePlan& OutPlan)
-{
-	// Distinguish genuinely-new/removable connections from ones already in the requested state,
-	// so both add and delete are idempotent and only real changes appear in the plan.
-	for (const FFlowGraphParsedConnection& ParsedConnection : ParsedConnections)
-	{
-		UFlowNode* SourceNode = CurrentNodes.FindRef(ParsedConnection.SourceNodeGuid);
-		UFlowNode* TargetNode = CurrentNodes.FindRef(ParsedConnection.TargetNodeGuid);
-		const bool bIsExecPin = IsExecConnectionSourcePin(SourceNode, ParsedConnection.SourcePinName);
-
-		// Exec connections key on SourceNode+SourcePinName; data connections key on
-		// TargetNode+TargetPinName (see UFlowGraphImporter::WriteConnectionToNode).
-		UFlowNode* KeyNode = bIsExecPin ? SourceNode : TargetNode;
-		const FName KeyPinName = bIsExecPin ? ParsedConnection.SourcePinName : ParsedConnection.TargetPinName;
-		const FGuid ExpectedOtherGuid = bIsExecPin ? ParsedConnection.TargetNodeGuid : ParsedConnection.SourceNodeGuid;
-		const FName ExpectedOtherPinName = bIsExecPin ? ParsedConnection.TargetPinName : ParsedConnection.SourcePinName;
-
-		FConnectedPin ExistingConnection;
-		bool bAlreadyPresent = false;
-		if (KeyNode)
-		{
-			ExistingConnection = KeyNode->GetConnection(KeyPinName);
-			bAlreadyPresent = ExistingConnection.NodeGuid == ExpectedOtherGuid && ExistingConnection.PinName == ExpectedOtherPinName;
-		}
-
-		const FString ConnectionLabel = FString::Printf(TEXT("%s.%s -> %s.%s"),
-			*ParsedConnection.SourceNodeGuid.ToString(), *ParsedConnection.SourcePinName.ToString(),
-			*ParsedConnection.TargetNodeGuid.ToString(), *ParsedConnection.TargetPinName.ToString());
-
-		if (ParsedConnection.bIsDeleteMarker)
-		{
-			if (bAlreadyPresent)
-			{
-				OutConnectionsToRemove.Add(ParsedConnection);
-				OutPlan.ConnectionsRemoved.Add(ConnectionLabel);
-			}
-
-			continue;
-		}
-
-		if (!bAlreadyPresent)
-		{
-			OutConnectionsToAdd.Add(ParsedConnection);
-			OutPlan.ConnectionsAdded.Add(ConnectionLabel);
-
-			// A pin has at most one connection at runtime - adding a connection to a pin that
-			// already points elsewhere implicitly retargets it. Report the superseded connection
-			// as removed so the plan reflects what actually changed.
-			if (ExistingConnection.NodeGuid.IsValid())
-			{
-				const FString SupersededLabel = bIsExecPin
-					? FString::Printf(TEXT("%s.%s -> %s.%s"), *ParsedConnection.SourceNodeGuid.ToString(), *ParsedConnection.SourcePinName.ToString(), *ExistingConnection.NodeGuid.ToString(), *ExistingConnection.PinName.ToString())
-					: FString::Printf(TEXT("%s.%s -> %s.%s"), *ExistingConnection.NodeGuid.ToString(), *ExistingConnection.PinName.ToString(), *ParsedConnection.TargetNodeGuid.ToString(), *ParsedConnection.TargetPinName.ToString());
-				OutPlan.ConnectionsRemoved.Add(SupersededLabel);
-			}
 		}
 	}
 }
@@ -1253,326 +1258,6 @@ bool FFlowGraphReconciler::RegraphAndVerify(
 	}
 
 	return true;
-}
-
-bool FFlowGraphReconciler::ApplyPlanToExistingAsset(
-	UFlowAsset* ExistingAsset,
-	const FFlowReconcileExecutionPlan& ExecutionPlan,
-	FFlowReconcileResult& Result,
-	FString& OutErrorMessage)
-{
-	// Apply the same AddOn callback ordering as preview, verify refreshed pins, and only then
-	// install generated-pin connections. An owned transaction lets the MCP caller abort any failed step.
-	TUniquePtr<FScopedTransaction> LocalTransaction;
-	if (!GEditor || !GEditor->Trans || !GEditor->Trans->IsActive())
-	{
-		LocalTransaction = MakeUnique<FScopedTransaction>(
-			NSLOCTEXT("FlowAgentToolkit", "ReconcileFlowGraph", "Reconcile Flow Graph"));
-	}
-	TArray<FName> AssetPropertyNames;
-	ExecutionPlan.StagedAssetProperties.GenerateKeyArray(AssetPropertyNames);
-	AssetPropertyNames.Sort(FNameLexicalLess());
-	for (const FName PropertyName : AssetPropertyNames)
-	{
-		const FFlowStagedAssetProperty& StagedProperty = ExecutionPlan.StagedAssetProperties.FindChecked(PropertyName);
-		if (!StagedProperty.bChanged)
-		{
-			continue;
-		}
-		if (!FFlowAssetPropertyPolicy::SetStagedObjectReference(
-			ExistingAsset, StagedProperty, /*bSendEditNotifications=*/true, OutErrorMessage))
-		{
-			Result.Findings.Add(OutErrorMessage);
-			return false;
-		}
-		if (UPackage* Package = ExistingAsset->GetOutermost())
-		{
-			Package->MarkPackageDirty();
-		}
-	}
-	if (UEdGraph* Graph = ExistingAsset->GetGraph())
-	{
-		Graph->SetFlags(RF_Transactional);
-		Graph->Modify();
-	}
-
-	FString ApplyError;
-
-	// Apply order follows spec section 6's fixed kind order: UpsertNode, UpsertAddon,
-	// AddConnection, RemoveConnection, DeleteAddon, DeleteNode. DeleteAddon is folded into the
-	// UpsertAddon step below (ReconcileNodeAddOns reconciles a node's whole addon set - add,
-	// update, and delete - in one pass), which does not create a cross-node hazard since addon
-	// deletes only ever affect their own owning node. DeleteNode runs last so a document may
-	// delete a node it also connected or addon'd earlier without ordering hazards;
-	// RemoveNodeAndReferencingConnections also cleans up any connections still pointing at it.
-
-	// Phase 1: create nodes and apply their reflected properties and declared pins.
-	TMap<FGuid, UFlowNode*> NewNodeMap;
-	if (!ApplyNodeChanges(ExistingAsset, ExecutionPlan, NewNodeMap, ApplyError))
-	{
-		OutErrorMessage = ApplyError;
-		Result.Findings.Add(ApplyError);
-		return false;
-	}
-
-	// Re-fetch after node adds so the addon and connection steps below can resolve newly-created
-	// nodes alongside pre-existing ones.
-	TMap<FGuid, UFlowNode*> CombinedNodeMap = ExistingAsset->GetNodes();
-
-	// Phases 2-4: reconcile full AddOn trees, dispatch callbacks, and refresh parent pins.
-	if (!ApplyAddOnChanges(ExistingAsset, ExecutionPlan, NewNodeMap, Result, ApplyError))
-	{
-		OutErrorMessage = ApplyError;
-		Result.Findings.Add(ApplyError);
-		return false;
-	}
-
-	// Phase 5: mutate connections only after live pins match the projected active schema.
-	if (!ApplyConnectionChanges(ExistingAsset, ExecutionPlan, CombinedNodeMap, ApplyError))
-	{
-		OutErrorMessage = ApplyError;
-		Result.Findings.Add(ApplyError);
-		return false;
-	}
-
-	// Phase 6: remove nodes last, after connection updates and AddOn reconciliation are complete.
-	for (const FGuid& NodeGuidToDelete : ExecutionPlan.NodesToDelete)
-	{
-		if (!RemoveNodeAndReferencingConnections(ExistingAsset, NodeGuidToDelete))
-		{
-			OutErrorMessage = FString::Printf(TEXT("Failed to delete node %s"), *NodeGuidToDelete.ToString());
-			Result.Findings.Add(OutErrorMessage);
-			return false;
-		}
-	}
-
-	// Phase 7: rebuild editor state and verify that the final connections and graph structure agree.
-	if (!RegraphAndVerify(ExistingAsset, ExecutionPlan, Result, OutErrorMessage))
-	{
-		return false;
-	}
-	return true;
-}
-
-TSharedPtr<FFlowReconcileExecutionPlan> FFlowGraphReconciler::ComputeReconcilePlan(
-	const FString& TargetAssetPath,
-	const FString& FlowAgentDocumentJson,
-	FString& OutErrorMessage)
-{
-	OutErrorMessage.Empty();
-
-	if (FlowAgentDocumentJson.IsEmpty())
-	{
-		OutErrorMessage = TEXT("FlowAgent document is empty");
-		return nullptr;
-	}
-
-	TSharedPtr<FFlowReconcileExecutionPlan> Plan = MakeShared<FFlowReconcileExecutionPlan>();
-	Plan->InputSizeBytes = FlowAgentDocumentJson.Len();
-
-	// Hard failure only for a document too malformed to reason about at all (bad JSON, wrong
-	// formatVersion). Every other problem the converter finds (identity ambiguity, bad GUIDs,
-	// unresolved aliases, field legality) is appended to ValidationFindings below and handled the
-	// same way a semantic FFlowGraphValidation finding is - as data, never by failing this call.
-	FFlowAgentDocument Document;
-	TArray<FFlowAgentIssue> FlowAgentIssues;
-	if (!FFlowAgentConverter::ParseDocument(FlowAgentDocumentJson, Document, FlowAgentIssues, OutErrorMessage))
-	{
-		return nullptr;
-	}
-
-	TArray<FFlowGraphParsedNode> ParsedNodes;
-	TArray<FFlowGraphParsedConnection> ParsedConnections;
-	TArray<FGuid> ScopedNodeGuids;
-	TMap<FString, FGuid> AliasMap;
-	FFlowAgentConverter::ConvertToParsedGraph(Document, ParsedNodes, ParsedConnections, ScopedNodeGuids, AliasMap, FlowAgentIssues);
-
-	AppendFlowAgentIssuesAsFindings(FlowAgentIssues, Plan->ValidationFindings);
-
-	UFlowAsset* ExistingAsset = FindOrLoadFlowAsset(TargetAssetPath);
-	UClass* ResolvedAssetClass = ExistingAsset ? ExistingAsset->GetClass() : UFlowAsset::StaticClass();
-	if (!ExistingAsset && !Document.AssetClass.IsEmpty() && !Document.AssetClass.Equals(TEXT("None"), ESearchCase::IgnoreCase))
-	{
-		UClass* const DocumentAssetClass = LoadObject<UClass>(nullptr, *Document.AssetClass);
-		if (DocumentAssetClass && DocumentAssetClass->IsChildOf(UFlowAsset::StaticClass()))
-		{
-			ResolvedAssetClass = DocumentAssetClass;
-		}
-	}
-	Plan->ResolvedAssetClass = ResolvedAssetClass;
-	StageAssetProperties(Document.AssetProperties, ResolvedAssetClass, ExistingAsset, *Plan);
-
-	// No asset yet: all nodes are adds, no validation possible.
-	if (!ExistingAsset)
-	{
-		if (!ComputePlanForNewAsset(Document.AssetClass, Document.bWorldBound, ParsedNodes, ParsedConnections, *Plan, OutErrorMessage))
-		{
-			return nullptr;
-		}
-		Plan->AliasMap = AliasMap;
-		return Plan;
-	}
-
-	// Asset exists: classify, validate. Aliasing/GUID resolution already happened in ConvertToParsedGraph.
-	Plan->AllParsedNodes = ParsedNodes;
-	Plan->AllParsedConnections = ParsedConnections;
-	Plan->AssetClassPath = Document.AssetClass;
-	Plan->bWorldBound = Document.bWorldBound;
-
-	// Spec section 4: on an existing asset, assetClass must match the real class or it is an
-	// error. An empty assetClass is not a mismatch - it means the document is silent on class,
-	// which is legal on a patch against an asset that already exists.
-	if (!Document.AssetClass.IsEmpty() && !Document.AssetClass.Equals(ExistingAsset->GetClass()->GetPathName(), ESearchCase::CaseSensitive))
-	{
-		FFlowValidationFinding& Finding = Plan->ValidationFindings.AddDefaulted_GetRef();
-		Finding.Severity = EFlowValidationSeverity::Error;
-		Finding.Code = TEXT("ClassMismatch");
-		Finding.Message = FString::Printf(TEXT("[ClassMismatch] document assetClass '%s' does not match existing asset class '%s'"), *Document.AssetClass, *ExistingAsset->GetClass()->GetPathName());
-	}
-
-	const TMap<FGuid, UFlowNode*>& CurrentNodes = ExistingAsset->GetNodes();
-	const int32 TotalExistingBeforeApply = CurrentNodes.Num();
-
-	// Full mode is authoritative over the whole asset: the effective scope is every existing node,
-	// not just ScopedNodeGuids (which the converter forces empty in Full mode - ScopeWithFullMode
-	// is a validation error otherwise). Patch mode keeps the document-declared scope unchanged.
-	TArray<FGuid> EffectiveScopedNodeGuids = ScopedNodeGuids;
-	if (Document.Mode == EFlowAgentMode::Full)
-	{
-		EffectiveScopedNodeGuids.Reset();
-		CurrentNodes.GenerateKeyArray(EffectiveScopedNodeGuids);
-	}
-
-	ClassifyParsedNodes(Plan->AllParsedNodes, EffectiveScopedNodeGuids, CurrentNodes,
-		Plan->NodesToAdd, Plan->NodesToUpdate, Plan->NodesToDelete, Plan->AliasMap);
-
-	// The converter's alias map is authoritative because ClassifyParsedNodes tracks node aliases only.
-	Plan->AliasMap = AliasMap;
-
-	Plan->Plan.NodesDeleted = Plan->NodesToDelete;
-	for (const FFlowGraphParsedNode& NodeToAdd : Plan->NodesToAdd)
-	{
-		Plan->Plan.NodesAdded.Add(NodeToAdd.NodeGuid);
-	}
-	for (const FFlowGraphParsedNode& NodeToUpdate : Plan->NodesToUpdate)
-	{
-		Plan->Plan.NodesUpdated.Add(NodeToUpdate.NodeGuid);
-	}
-
-	// Full mode also implicitly removes any existing connection the document doesn't re-declare.
-	// Appended as synthetic delete markers so ClassifyParsedConnections' existing idempotency
-	// check (only report a removal if the connection is actually present) applies unchanged.
-	if (Document.Mode == EFlowAgentMode::Full)
-	{
-		TArray<FFlowGraphParsedConnection> ExistingConnections;
-		CollectExistingConnections(CurrentNodes, ExistingConnections);
-
-		TSet<FString> DeclaredConnectionKeys;
-		DeclaredConnectionKeys.Reserve(Plan->AllParsedConnections.Num());
-		for (const FFlowGraphParsedConnection& ParsedConnection : Plan->AllParsedConnections)
-		{
-			if (!ParsedConnection.bIsDeleteMarker)
-			{
-				DeclaredConnectionKeys.Add(FString::Printf(TEXT("%s.%s -> %s.%s"),
-					*ParsedConnection.SourceNodeGuid.ToString(), *ParsedConnection.SourcePinName.ToString(),
-					*ParsedConnection.TargetNodeGuid.ToString(), *ParsedConnection.TargetPinName.ToString()));
-			}
-		}
-
-		for (const FFlowGraphParsedConnection& ExistingConnection : ExistingConnections)
-		{
-			const FString Key = FString::Printf(TEXT("%s.%s -> %s.%s"),
-				*ExistingConnection.SourceNodeGuid.ToString(), *ExistingConnection.SourcePinName.ToString(),
-				*ExistingConnection.TargetNodeGuid.ToString(), *ExistingConnection.TargetPinName.ToString());
-			if (!DeclaredConnectionKeys.Contains(Key))
-			{
-				FFlowGraphParsedConnection& DeleteMarker = Plan->AllParsedConnections.Add_GetRef(ExistingConnection);
-				DeleteMarker.bIsDeleteMarker = true;
-			}
-		}
-	}
-
-	ClassifyParsedConnections(Plan->AllParsedConnections, CurrentNodes,
-		Plan->ConnectionsToAdd, Plan->ConnectionsToRemove, Plan->Plan);
-
-	Plan->NodesTouched = Plan->NodesToAdd.Num() + Plan->NodesToUpdate.Num() + Plan->NodesToDelete.Num();
-	Plan->NodesPreserved = TotalExistingBeforeApply - (Plan->NodesToUpdate.Num() + Plan->NodesToDelete.Num());
-
-	// Pre-commit validation on the fully-resolved document and its isolated final pin schema.
-	const TSet<FGuid> PostPlanNodeGuids = BuildPostPlanNodeSet(CurrentNodes, Plan->NodesToAdd, Plan->NodesToDelete);
-	FString PreviewError;
-	if (!BuildEffectivePinSchema(
-		ExistingAsset, *Plan, Plan->ProjectedPinSchema, PreviewError, &Plan->EffectiveStateAsset))
-	{
-		FFlowValidationFinding& Finding = Plan->ValidationFindings.AddDefaulted_GetRef();
-		Finding.Severity = EFlowValidationSeverity::Error;
-		Finding.Code = TEXT("PinSchemaPreviewFailed");
-		Finding.Message = PreviewError;
-	}
-	FFlowValidationContext ValidationContext;
-	ValidationContext.TargetAsset = ExistingAsset;
-	ValidationContext.EffectiveAsset = Plan->EffectiveStateAsset.Get();
-	ValidationContext.ResolvedAssetClass = ResolvedAssetClass;
-	ValidationContext.StagedAssetProperties = &Plan->StagedAssetProperties;
-	const UFlowAsset* ValidationAsset = Plan->EffectiveStateAsset.IsValid()
-		? Plan->EffectiveStateAsset.Get()
-		: ExistingAsset;
-	FFlowGraphValidation::ValidateDocument(ValidationAsset, Plan->AllParsedNodes,
-		Plan->AllParsedConnections, Plan->ValidationFindings, &PostPlanNodeGuids,
-		&Plan->ProjectedPinSchema, &ValidationContext);
-
-	return Plan;
-}
-
-FFlowReconcileResult FFlowGraphReconciler::ExecuteReconcilePlan(
-	const FFlowReconcileExecutionPlan& ExecutionPlan,
-	const FString& TargetAssetPath,
-	FString& OutErrorMessage)
-{
-	FFlowReconcileResult Result;
-	OutErrorMessage.Empty();
-
-	Result.Plan = ExecutionPlan.Plan;
-	Result.AliasMap = ExecutionPlan.AliasMap;
-	Result.ValidationFindings = ExecutionPlan.ValidationFindings;
-	Result.NodesTouched = ExecutionPlan.NodesTouched;
-	Result.NodesPreserved = ExecutionPlan.NodesPreserved;
-	Result.InputSizeBytes = ExecutionPlan.InputSizeBytes;
-
-	// Refuse to apply if validation found any blocking errors.
-	const bool bHasBlockingError = ExecutionPlan.ValidationFindings.ContainsByPredicate(
-		[](const FFlowValidationFinding& F) { return F.Severity == EFlowValidationSeverity::Error; });
-
-	if (bHasBlockingError)
-	{
-		OutErrorMessage = TEXT("Validation failed - see ValidationFindings; the asset was not modified");
-		Result.Findings.Add(OutErrorMessage);
-		return Result;
-	}
-
-	if (ExecutionPlan.bIsNewAsset)
-	{
-		if (ExecutePlanForNewAsset(ExecutionPlan, TargetAssetPath, Result, OutErrorMessage))
-		{
-			Result.bSuccess = true;
-		}
-		return Result;
-	}
-
-	UFlowAsset* ExistingAsset = FindOrLoadFlowAsset(TargetAssetPath);
-	if (!ExistingAsset)
-	{
-		OutErrorMessage = FString::Printf(TEXT("Asset no longer exists at %s; cannot apply plan"), *TargetAssetPath);
-		Result.Findings.Add(OutErrorMessage);
-		return Result;
-	}
-
-	if (ApplyPlanToExistingAsset(ExistingAsset, ExecutionPlan, Result, OutErrorMessage))
-	{
-		Result.bSuccess = true;
-	}
-
-	return Result;
 }
 
 bool FFlowGraphReconciler::RemoveNodeAndReferencingConnections(UFlowAsset* FlowAsset, const FGuid& NodeGuidToRemove)
@@ -1918,175 +1603,490 @@ bool FFlowGraphReconciler::NormalizePropertyValueString(FProperty* Property, con
 	return bParsed;
 }
 
-bool FFlowGraphReconciler::FindOrCreateNode(
-	const FString& TargetAssetPath,
-	const FString& NodeType,
-	const TMap<FString, FString>& MatchProperties,
-	bool bDryRun,
-	FGuid& OutNodeGuid,
-	bool& OutCreated,
-	FString& OutErrorMessage)
+void FFlowGraphReconciler::ClassifyParsedNodes(
+	const TArray<FFlowGraphParsedNode>& ParsedNodes,
+	const TArray<FGuid>& ScopedNodeGuids,
+	const TMap<FGuid, UFlowNode*>& CurrentNodes,
+	TArray<FFlowGraphParsedNode>& OutNodesToAdd,
+	TArray<FFlowGraphParsedNode>& OutNodesToUpdate,
+	TArray<FGuid>& OutNodesToDelete,
+	TMap<FString, FGuid>& OutAliasMap)
 {
-	OutNodeGuid.Invalidate();
-	OutCreated = false;
-
-	UClass* ResolvedClass = UFlowGraphImporter::ResolveNodeClass(NodeType);
-	if (!ResolvedClass)
+	for (const FFlowGraphParsedNode& ParsedNode : ParsedNodes)
 	{
-		OutErrorMessage = FString::Printf(TEXT("FindOrCreateNode: could not resolve NodeType: %s"), *NodeType);
-		return false;
-	}
-
-	// RS13: an unknown property name is a hard error, checked once against the class up front -
-	// independent of whether any node instance exists yet to compare against. Each raw value is
-	// also normalized here (parse -> re-stringify through the same path the create path uses) so
-	// the match comparison below compares canonical forms on both sides - otherwise a caller
-	// passing e.g. "123" for a float property would never match a node created from "123.0".
-	TArray<FProperty*> MatchFProperties;
-	TArray<FString> NormalizedMatchValues;
-	MatchFProperties.Reserve(MatchProperties.Num());
-	NormalizedMatchValues.Reserve(MatchProperties.Num());
-	for (const TPair<FString, FString>& Pair : MatchProperties)
-	{
-		FProperty* Property = ResolvedClass->FindPropertyByName(FName(*Pair.Key));
-		if (!Property)
+		if (ParsedNode.bIsDeleteMarker)
 		{
-			OutErrorMessage = FString::Printf(TEXT("FindOrCreateNode: %s has no property named '%s'"), *ResolvedClass->GetName(), *Pair.Key);
-			return false;
+			if (CurrentNodes.Contains(ParsedNode.NodeGuid))
+			{
+				OutNodesToDelete.Add(ParsedNode.NodeGuid);
+			}
+			continue;
 		}
 
-		FString NormalizedValue;
-		FString NormalizeError;
-		if (!NormalizePropertyValueString(Property, Pair.Value, NormalizedValue, NormalizeError))
+		if (ParsedNode.bIsNewAlias || !CurrentNodes.Contains(ParsedNode.NodeGuid))
 		{
-			OutErrorMessage = FString::Printf(TEXT("FindOrCreateNode: %s"), *NormalizeError);
-			return false;
+			OutNodesToAdd.Add(ParsedNode);
+			if (ParsedNode.bIsNewAlias && !ParsedNode.Alias.IsEmpty())
+			{
+				OutAliasMap.Add(ParsedNode.Alias, ParsedNode.NodeGuid);
+			}
 		}
-
-		MatchFProperties.Add(Property);
-		NormalizedMatchValues.Add(NormalizedValue);
+		else
+		{
+			OutNodesToUpdate.Add(ParsedNode);
+		}
 	}
 
-	UFlowAsset* ExistingAsset = FindOrLoadFlowAsset(TargetAssetPath);
-	if (!ExistingAsset)
+	// A node named in scope but absent from this document's [NODES] section is treated as an
+	// implicit delete, as if "-Node: <Guid>" had been written. A node not named in scope is
+	// never affected by this loop - unscoped omission means "untouched".
+	// Build the upsert set once so the per-scope-entry lookup is O(1), not O(ParsedNodes).
+	TSet<FGuid> UpsertedGuids;
+	UpsertedGuids.Reserve(ParsedNodes.Num());
+	for (const FFlowGraphParsedNode& ParsedNode : ParsedNodes)
 	{
-		OutErrorMessage = FString::Printf(TEXT("FindOrCreateNode: no existing asset at %s (this helper does not create the asset itself)"), *TargetAssetPath);
-		return false;
+		if (!ParsedNode.bIsDeleteMarker)
+		{
+			UpsertedGuids.Add(ParsedNode.NodeGuid);
+		}
 	}
 
-	// Exact-class match only (not IsA) - a subclass is a different type as far as this helper is
-	// concerned, matching RS13's exact-equality philosophy applied to identity as well as values.
-	TArray<FGuid> MatchingGuids;
-	for (const TPair<FGuid, UFlowNode*>& NodePair : ExistingAsset->GetNodes())
+	for (const FGuid& ScopedGuid : ScopedNodeGuids)
 	{
-		UFlowNode* Node = NodePair.Value;
-		if (!Node || Node->GetClass() != ResolvedClass)
+		if (!CurrentNodes.Contains(ScopedGuid) || OutNodesToDelete.Contains(ScopedGuid))
 		{
 			continue;
 		}
 
-		bool bAllMatch = true;
-		for (int32 PropIndex = 0; PropIndex < MatchFProperties.Num(); ++PropIndex)
+		if (!UpsertedGuids.Contains(ScopedGuid))
 		{
-			FProperty* Property = MatchFProperties[PropIndex];
-			const void* ValuePtr = Property->ContainerPtrToValuePtr<void>(Node);
-			const FString CurrentValue = UFlowGraphExporter::GetPropertyValueAsString(Property, ValuePtr);
-			if (CurrentValue != NormalizedMatchValues[PropIndex])
+			OutNodesToDelete.Add(ScopedGuid);
+		}
+	}
+}
+
+void FFlowGraphReconciler::ClassifyParsedConnections(
+	const TArray<FFlowGraphParsedConnection>& ParsedConnections,
+	const TMap<FGuid, UFlowNode*>& CurrentNodes,
+	TArray<FFlowGraphParsedConnection>& OutConnectionsToAdd,
+	TArray<FFlowGraphParsedConnection>& OutConnectionsToRemove,
+	FFlowReconcilePlan& OutPlan)
+{
+	// Distinguish genuinely-new/removable connections from ones already in the requested state,
+	// so both add and delete are idempotent and only real changes appear in the plan.
+	for (const FFlowGraphParsedConnection& ParsedConnection : ParsedConnections)
+	{
+		UFlowNode* SourceNode = CurrentNodes.FindRef(ParsedConnection.SourceNodeGuid);
+		UFlowNode* TargetNode = CurrentNodes.FindRef(ParsedConnection.TargetNodeGuid);
+		const bool bIsExecPin = IsExecConnectionSourcePin(SourceNode, ParsedConnection.SourcePinName);
+
+		// Exec connections key on SourceNode+SourcePinName; data connections key on
+		// TargetNode+TargetPinName (see UFlowGraphImporter::WriteConnectionToNode).
+		UFlowNode* KeyNode = bIsExecPin ? SourceNode : TargetNode;
+		const FName KeyPinName = bIsExecPin ? ParsedConnection.SourcePinName : ParsedConnection.TargetPinName;
+		const FGuid ExpectedOtherGuid = bIsExecPin ? ParsedConnection.TargetNodeGuid : ParsedConnection.SourceNodeGuid;
+		const FName ExpectedOtherPinName = bIsExecPin ? ParsedConnection.TargetPinName : ParsedConnection.SourcePinName;
+
+		FConnectedPin ExistingConnection;
+		bool bAlreadyPresent = false;
+		if (KeyNode)
+		{
+			ExistingConnection = KeyNode->GetConnection(KeyPinName);
+			bAlreadyPresent = ExistingConnection.NodeGuid == ExpectedOtherGuid && ExistingConnection.PinName == ExpectedOtherPinName;
+		}
+
+		const FString ConnectionLabel = FString::Printf(TEXT("%s.%s -> %s.%s"),
+			*ParsedConnection.SourceNodeGuid.ToString(), *ParsedConnection.SourcePinName.ToString(),
+			*ParsedConnection.TargetNodeGuid.ToString(), *ParsedConnection.TargetPinName.ToString());
+
+		if (ParsedConnection.bIsDeleteMarker)
+		{
+			if (bAlreadyPresent)
 			{
-				bAllMatch = false;
-				break;
+				OutConnectionsToRemove.Add(ParsedConnection);
+				OutPlan.ConnectionsRemoved.Add(ConnectionLabel);
+			}
+
+			continue;
+		}
+
+		if (!bAlreadyPresent)
+		{
+			OutConnectionsToAdd.Add(ParsedConnection);
+			OutPlan.ConnectionsAdded.Add(ConnectionLabel);
+
+			// A pin has at most one connection at runtime - adding a connection to a pin that
+			// already points elsewhere implicitly retargets it. Report the superseded connection
+			// as removed so the plan reflects what actually changed.
+			if (ExistingConnection.NodeGuid.IsValid())
+			{
+				const FString SupersededLabel = bIsExecPin
+					? FString::Printf(TEXT("%s.%s -> %s.%s"), *ParsedConnection.SourceNodeGuid.ToString(), *ParsedConnection.SourcePinName.ToString(), *ExistingConnection.NodeGuid.ToString(), *ExistingConnection.PinName.ToString())
+					: FString::Printf(TEXT("%s.%s -> %s.%s"), *ExistingConnection.NodeGuid.ToString(), *ExistingConnection.PinName.ToString(), *ParsedConnection.TargetNodeGuid.ToString(), *ParsedConnection.TargetPinName.ToString());
+				OutPlan.ConnectionsRemoved.Add(SupersededLabel);
 			}
 		}
+	}
+}
 
-		if (bAllMatch)
+bool FFlowGraphReconciler::ApplyPlanToExistingAsset(
+	UFlowAsset* ExistingAsset,
+	const FFlowReconcileExecutionPlan& ExecutionPlan,
+	FFlowReconcileResult& Result,
+	FString& OutErrorMessage)
+{
+	// Apply the same AddOn callback ordering as preview, verify refreshed pins, and only then
+	// install generated-pin connections. An owned transaction lets the MCP caller abort any failed step.
+	TUniquePtr<FScopedTransaction> LocalTransaction;
+	if (!GEditor || !GEditor->Trans || !GEditor->Trans->IsActive())
+	{
+		LocalTransaction = MakeUnique<FScopedTransaction>(
+			NSLOCTEXT("FlowAgentToolkit", "ReconcileFlowGraph", "Reconcile Flow Graph"));
+	}
+	TArray<FName> AssetPropertyNames;
+	ExecutionPlan.StagedAssetProperties.GenerateKeyArray(AssetPropertyNames);
+	AssetPropertyNames.Sort(FNameLexicalLess());
+	for (const FName PropertyName : AssetPropertyNames)
+	{
+		const FFlowStagedAssetProperty& StagedProperty = ExecutionPlan.StagedAssetProperties.FindChecked(PropertyName);
+		if (!StagedProperty.bChanged)
 		{
-			MatchingGuids.Add(NodePair.Key);
+			continue;
+		}
+		if (!FFlowAssetPropertyPolicy::SetStagedObjectReference(
+			ExistingAsset, StagedProperty, /*bSendEditNotifications=*/true, OutErrorMessage))
+		{
+			Result.Findings.Add(OutErrorMessage);
+			return false;
+		}
+		if (UPackage* Package = ExistingAsset->GetOutermost())
+		{
+			Package->MarkPackageDirty();
+		}
+	}
+	if (UEdGraph* Graph = ExistingAsset->GetGraph())
+	{
+		Graph->SetFlags(RF_Transactional);
+		Graph->Modify();
+	}
+
+	FString ApplyError;
+
+	// Apply order follows spec section 6's fixed kind order: UpsertNode, UpsertAddon,
+	// AddConnection, RemoveConnection, DeleteAddon, DeleteNode. DeleteAddon is folded into the
+	// UpsertAddon step below (ReconcileNodeAddOns reconciles a node's whole addon set - add,
+	// update, and delete - in one pass), which does not create a cross-node hazard since addon
+	// deletes only ever affect their own owning node. DeleteNode runs last so a document may
+	// delete a node it also connected or addon'd earlier without ordering hazards;
+	// RemoveNodeAndReferencingConnections also cleans up any connections still pointing at it.
+
+	// Phase 1: create nodes and apply their reflected properties and declared pins.
+	TMap<FGuid, UFlowNode*> NewNodeMap;
+	if (!ApplyNodeChanges(ExistingAsset, ExecutionPlan, NewNodeMap, ApplyError))
+	{
+		OutErrorMessage = ApplyError;
+		Result.Findings.Add(ApplyError);
+		return false;
+	}
+
+	// Re-fetch after node adds so the addon and connection steps below can resolve newly-created
+	// nodes alongside pre-existing ones.
+	TMap<FGuid, UFlowNode*> CombinedNodeMap = ExistingAsset->GetNodes();
+
+	// Phases 2-4: reconcile full AddOn trees, dispatch callbacks, and refresh parent pins.
+	if (!ApplyAddOnChanges(ExistingAsset, ExecutionPlan, NewNodeMap, Result, ApplyError))
+	{
+		OutErrorMessage = ApplyError;
+		Result.Findings.Add(ApplyError);
+		return false;
+	}
+
+	// Phase 5: mutate connections only after live pins match the projected active schema.
+	if (!ApplyConnectionChanges(ExistingAsset, ExecutionPlan, CombinedNodeMap, ApplyError))
+	{
+		OutErrorMessage = ApplyError;
+		Result.Findings.Add(ApplyError);
+		return false;
+	}
+
+	// Phase 6: remove nodes last, after connection updates and AddOn reconciliation are complete.
+	for (const FGuid& NodeGuidToDelete : ExecutionPlan.NodesToDelete)
+	{
+		if (!RemoveNodeAndReferencingConnections(ExistingAsset, NodeGuidToDelete))
+		{
+			OutErrorMessage = FString::Printf(TEXT("Failed to delete node %s"), *NodeGuidToDelete.ToString());
+			Result.Findings.Add(OutErrorMessage);
+			return false;
 		}
 	}
 
-	if (!MatchingGuids.IsEmpty())
+	// Phase 7: rebuild editor state and verify that the final connections and graph structure agree.
+	if (!RegraphAndVerify(ExistingAsset, ExecutionPlan, Result, OutErrorMessage))
 	{
-		// Deterministic tiebreak (RS13): lowest FGuid::ToString() wins, same convention the
-		// exporter already uses for stable ordering - never an ambiguity error, so a repeated
-		// idempotent call never starts failing just because an unrelated later change added a
-		// second coincidentally-matching node.
-		MatchingGuids.Sort([](const FGuid& A, const FGuid& B) { return A.ToString() < B.ToString(); });
-		OutNodeGuid = MatchingGuids[0];
-		OutCreated = false;
-		return true;
-	}
-
-	// No match: create exactly one new node via the same ComputeReconcilePlan/ExecuteReconcilePlan
-	// pipeline apply_flow_patch uses, so the same pre-commit validation, auto-placement, and
-	// regraph apply - never a hand-rolled parallel creation path.
-	static const FString NewNodeAlias = TEXT("findorcreate");
-
-	TSharedRef<FJsonObject> PropertiesObject = MakeShared<FJsonObject>();
-	for (const TPair<FString, FString>& Pair : MatchProperties)
-	{
-		PropertiesObject->SetStringField(Pair.Key, Pair.Value);
-	}
-
-	TSharedRef<FJsonObject> OpObject = MakeShared<FJsonObject>();
-	OpObject->SetStringField(TEXT("kind"), TEXT("UpsertNode"));
-	OpObject->SetStringField(TEXT("newAlias"), NewNodeAlias);
-	OpObject->SetStringField(TEXT("type"), ResolvedClass->GetPathName());
-	OpObject->SetObjectField(TEXT("properties"), PropertiesObject);
-
-	TArray<TSharedPtr<FJsonValue>> OpsArray;
-	OpsArray.Add(MakeShared<FJsonValueObject>(OpObject));
-
-	const FString ExpectedOwnerClass = ExistingAsset->GetExpectedOwnerClass().ToSoftObjectPath().GetAssetName();
-	TSharedRef<FJsonObject> DocumentObject = MakeShared<FJsonObject>();
-	DocumentObject->SetNumberField(TEXT("formatVersion"), 2);
-	DocumentObject->SetStringField(TEXT("mode"), TEXT("Patch"));
-	DocumentObject->SetStringField(TEXT("assetClass"), ExistingAsset->GetClass()->GetPathName());
-	DocumentObject->SetBoolField(TEXT("bWorldBound"), ExistingAsset->bWorldBound);
-	DocumentObject->SetStringField(TEXT("expectedOwnerClass"), ExpectedOwnerClass);
-	DocumentObject->SetArrayField(TEXT("ops"), OpsArray);
-
-	FString MutationDocumentJson;
-	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&MutationDocumentJson);
-	FJsonSerializer::Serialize(DocumentObject, Writer);
-
-	FString ComputeError;
-	TSharedPtr<FFlowReconcileExecutionPlan> ExecutionPlan = ComputeReconcilePlan(TargetAssetPath, MutationDocumentJson, ComputeError);
-	if (!ExecutionPlan)
-	{
-		OutErrorMessage = ComputeError.IsEmpty() ? TEXT("FindOrCreateNode: failed to compute creation plan") : ComputeError;
 		return false;
 	}
+	return true;
+}
 
-	const FGuid* MintedGuid = ExecutionPlan->AliasMap.Find(NewNodeAlias);
-	if (!MintedGuid)
-	{
-		OutErrorMessage = TEXT("FindOrCreateNode: creation plan did not mint a GUID for the new node");
-		return false;
-	}
+// new-asset compute: populates plan summary and execution data from an already-converted
+// document. There is no existing asset to validate class-allowance/attachment rules against, but
+// pin existence and connection endpoints are fully determined by the document itself (every node
+// referenced is either in ParsedNodes or the document is invalid), so ValidateDocument still runs
+// with a null TargetAsset and the full set of added node GUIDs as PostPlanNodeGuids.
+bool FFlowGraphReconciler::ComputePlanForNewAsset(
+	const FString& AssetClassPath,
+	bool bWorldBound,
+	const TArray<FFlowGraphParsedNode>& ParsedNodes,
+	const TArray<FFlowGraphParsedConnection>& ParsedConnections,
+	FFlowReconcileExecutionPlan& OutPlan,
+	FString& OutErrorMessage)
+{
+	OutPlan.AllParsedNodes = ParsedNodes;
+	OutPlan.AllParsedConnections = ParsedConnections;
+	OutPlan.AssetClassPath = AssetClassPath;
+	OutPlan.bWorldBound = bWorldBound;
 
-	if (bDryRun)
+	for (const FFlowGraphParsedNode& ParsedNode : OutPlan.AllParsedNodes)
 	{
-		if (!FFlowGraphValidation::HasNoErrors(ExecutionPlan->ValidationFindings))
+		if (!ParsedNode.bIsDeleteMarker)
 		{
-			OutErrorMessage = TEXT("FindOrCreateNode: dry-run plan has blocking validation errors");
+			OutPlan.NodesToAdd.Add(ParsedNode);
+			OutPlan.Plan.NodesAdded.Add(ParsedNode.NodeGuid);
+		}
+	}
+
+	// Every connection in the document is new on an asset that does not exist yet. Reporting them
+	// here is what lets a dry-run create say what it would connect; ExecutePlanForNewAsset then
+	// replaces this intent with what actually landed. Without it a create reports adding no
+	// connections while silently making them - a claim contradicted by the asset itself.
+	for (const FFlowGraphParsedConnection& ParsedConnection : OutPlan.AllParsedConnections)
+	{
+		if (!ParsedConnection.bIsDeleteMarker)
+		{
+			OutPlan.Plan.ConnectionsAdded.Add(FString::Printf(TEXT("%s.%s -> %s.%s"),
+				*ParsedConnection.SourceNodeGuid.ToString(), *ParsedConnection.SourcePinName.ToString(),
+				*ParsedConnection.TargetNodeGuid.ToString(), *ParsedConnection.TargetPinName.ToString()));
+		}
+	}
+
+	OutPlan.NodesTouched = OutPlan.Plan.NodesAdded.Num();
+	OutPlan.NodesPreserved = 0;
+	OutPlan.bIsNewAsset = true;
+
+	const TSet<FGuid> PostPlanNodeGuids = BuildPostPlanNodeSet(TMap<FGuid, UFlowNode*>(), OutPlan.NodesToAdd, TArray<FGuid>());
+	// Project new nodes and their AddOn trees before validating same-document generated-pin connections.
+	FString PreviewError;
+	if (!BuildEffectivePinSchema(
+		nullptr, OutPlan, OutPlan.ProjectedPinSchema, PreviewError, &OutPlan.EffectiveStateAsset))
+	{
+		FFlowValidationFinding& Finding = OutPlan.ValidationFindings.AddDefaulted_GetRef();
+		Finding.Severity = EFlowValidationSeverity::Error;
+		Finding.Code = TEXT("PinSchemaPreviewFailed");
+		Finding.Message = PreviewError;
+	}
+	FFlowValidationContext ValidationContext;
+	ValidationContext.EffectiveAsset = OutPlan.EffectiveStateAsset.Get();
+	ValidationContext.ResolvedAssetClass = OutPlan.ResolvedAssetClass;
+	ValidationContext.StagedAssetProperties = &OutPlan.StagedAssetProperties;
+	FFlowGraphValidation::ValidateDocument(OutPlan.EffectiveStateAsset.Get(), OutPlan.AllParsedNodes,
+		OutPlan.AllParsedConnections, OutPlan.ValidationFindings, &PostPlanNodeGuids,
+		&OutPlan.ProjectedPinSchema, &ValidationContext);
+
+	return true;
+}
+
+bool FFlowGraphReconciler::BuildEffectivePinSchema(
+	UFlowAsset* ExistingAsset,
+	const FFlowReconcileExecutionPlan& ExecutionPlan,
+	FFlowProjectedPinSchema& OutProjectedPinSchema,
+	FString& OutErrorMessage,
+	TStrongObjectPtr<UFlowAsset>* OutEffectiveAsset)
+{
+	OutErrorMessage.Reset();
+	OutProjectedPinSchema.Reset();
+
+	// Validation must preview the exact AddOn-generated pins from the requested final state,
+	// because FlowAgent resolves connections before its live mutation begins.
+	FlowGraphEffectiveStateDetail::FFlowEffectivePinSchemaPreview Preview;
+	if (!FlowGraphEffectiveStateDetail::CreatePreviewAsset(
+		ExistingAsset, ExecutionPlan, Preview.Asset, OutErrorMessage))
+	{
+		return false;
+	}
+	if (ExistingAsset)
+	{
+		if (!FFlowAssetPropertyPolicy::CopyRegisteredProperties(ExistingAsset, Preview.Asset.Get(), OutErrorMessage))
+		{
+			return false;
+		}
+	}
+	else
+	{
+		Preview.Asset->bWorldBound = ExecutionPlan.bWorldBound;
+	}
+
+	TArray<FName> StagedPropertyNames;
+	ExecutionPlan.StagedAssetProperties.GenerateKeyArray(StagedPropertyNames);
+	StagedPropertyNames.Sort(FNameLexicalLess());
+	for (const FName PropertyName : StagedPropertyNames)
+	{
+		const FFlowStagedAssetProperty& StagedProperty = ExecutionPlan.StagedAssetProperties.FindChecked(PropertyName);
+		if (StagedProperty.bChanged && !FFlowAssetPropertyPolicy::SetStagedObjectReference(
+			Preview.Asset.Get(), StagedProperty, /*bSendEditNotifications=*/true, OutErrorMessage))
+		{
+			return false;
+		}
+	}
+	FlowGraphEffectiveStateDetail::IndexPreviewPlan(ExecutionPlan, Preview);
+
+	// Build isolated node identity and state first, then attach those nodes to the preview asset map.
+	if (!FlowGraphEffectiveStateDetail::DuplicateExistingNodes(ExistingAsset, Preview, OutErrorMessage) ||
+		!FlowGraphEffectiveStateDetail::InstantiateAddedNodes(ExecutionPlan, Preview, OutErrorMessage) ||
+		!FlowGraphEffectiveStateDetail::RegisterPreviewNodes(Preview, OutErrorMessage))
+	{
+		return false;
+	}
+
+	// Apply node properties and declared pins after preview nodes have their final identity and parent map.
+	for (const FFlowGraphParsedNode& ParsedNode : ExecutionPlan.AllParsedNodes)
+	{
+		if (ParsedNode.bIsDeleteMarker)
+		{
+			continue;
+		}
+
+		UFlowNode* PreviewNode = Preview.Nodes.FindRef(ParsedNode.NodeGuid);
+		if (!IsValid(PreviewNode))
+		{
+			OutErrorMessage = FString::Printf(
+				TEXT("Could not find isolated node preview for %s"), *ParsedNode.NodeGuid.ToString());
 			return false;
 		}
 
-		OutNodeGuid = *MintedGuid;
-		OutCreated = true;
-		return true;
+		if (!UFlowGraphImporter::SetNodeProperties(PreviewNode, ParsedNode.Properties, OutErrorMessage))
+		{
+			return false;
+		}
+		PreviewNode->TryUpdateAutoDataPins();
+		UFlowGraphImporter::ApplyDeclaredPins(PreviewNode, ParsedNode);
 	}
 
-	FString ExecuteError;
-	FFlowReconcileResult Result = ExecuteReconcilePlan(*ExecutionPlan, TargetAssetPath, ExecuteError);
-	if (!Result.bSuccess)
+	// Apply AddOn edits into a shared notification set so callbacks wait until every tree is complete.
+	FFlowPendingAddOnPropertyChanges PendingPropertyChanges;
+	TArray<FFlowReconcileAddonEntry> PreviewAddOnsAdded;
+	TArray<FFlowReconcileAddonEntry> PreviewAddOnsUpdated;
+	TArray<FFlowReconcileAddonEntry> PreviewAddOnsDeleted;
+	for (const FFlowGraphParsedNode& ParsedNode : ExecutionPlan.AllParsedNodes)
 	{
-		OutErrorMessage = ExecuteError.IsEmpty() ? TEXT("FindOrCreateNode: failed to execute creation plan") : ExecuteError;
+		if (ParsedNode.bIsDeleteMarker)
+		{
+			continue;
+		}
+
+		UFlowNode* PreviewNode = Preview.Nodes.FindRef(ParsedNode.NodeGuid);
+		if (Preview.AddedNodeGuids.Contains(ParsedNode.NodeGuid))
+		{
+			if (!UFlowGraphImporter::CreateAddOnsRecursive(
+				PreviewNode, ParsedNode.AddOns, PendingPropertyChanges, OutErrorMessage))
+			{
+				return false;
+			}
+		}
+		else if (!ParsedNode.AddOns.IsEmpty() || ParsedNode.bIsFullBlock)
+		{
+			if (!ReconcileNodeAddOns(PreviewNode, ParsedNode.NodeGuid, ParsedNode.AddOns, PendingPropertyChanges,
+				PreviewAddOnsAdded, PreviewAddOnsUpdated, PreviewAddOnsDeleted, OutErrorMessage, ParsedNode.bIsFullBlock))
+			{
+				return false;
+			}
+		}
+	}
+
+	// Run the same child-before-parent callbacks used during execution, then refresh auto data pins.
+	TArray<UFlowNodeBase*> PreviewRootOwners;
+	PreviewRootOwners.Reserve(Preview.Nodes.Num());
+	for (const TPair<FGuid, UFlowNode*>& PreviewNodePair : Preview.Nodes)
+	{
+		PreviewRootOwners.Add(PreviewNodePair.Value);
+	}
+	if (!UFlowGraphImporter::DispatchPendingAddOnPropertyChanges(
+		PreviewRootOwners, PendingPropertyChanges, OutErrorMessage))
+	{
 		return false;
 	}
 
-	const FGuid* ExecutedGuid = Result.AliasMap.Find(NewNodeAlias);
-	OutNodeGuid = ExecutedGuid ? *ExecutedGuid : *MintedGuid;
-	OutCreated = true;
+	FlowGraphEffectiveStateDetail::RefreshPreviewAutoPins(Preview);
+	if (!FlowGraphEffectiveStateDetail::CollectProjectedPinSchema(
+		ExistingAsset, Preview, OutProjectedPinSchema, OutErrorMessage))
+	{
+		return false;
+	}
+	if (OutEffectiveAsset)
+	{
+		*OutEffectiveAsset = MoveTemp(Preview.Asset);
+	}
+	return true;
+}
+
+// new-asset execute: full import + regraph.
+bool FFlowGraphReconciler::ExecutePlanForNewAsset(
+	const FFlowReconcileExecutionPlan& ExecutionPlan,
+	const FString& TargetAssetPath,
+	FFlowReconcileResult& Result,
+	FString& OutErrorMessage)
+{
+	UFlowAsset* CreatedAsset = UFlowGraphImporter::ImportFlowGraphFromDocument(
+		TargetAssetPath,
+		ExecutionPlan.AssetClassPath,
+		ExecutionPlan.bWorldBound,
+		ExecutionPlan.AllParsedNodes,
+		ExecutionPlan.AllParsedConnections,
+		OutErrorMessage,
+		&ExecutionPlan.ProjectedPinSchema,
+		&ExecutionPlan.StagedAssetProperties);
+	if (!CreatedAsset)
+	{
+		Result.Findings.Add(OutErrorMessage);
+		return false;
+	}
+
+	// Extract positions from the already-parsed node list (same as ApplyPlanToExistingAsset does)
+	// so aliased nodes keep the GUIDs already minted by the converter.
+	TMap<FGuid, FIntPoint> NodePositions;
+	for (const FFlowGraphParsedNode& ParsedNode : ExecutionPlan.AllParsedNodes)
+	{
+		if (ParsedNode.bHasPos && !ParsedNode.bIsDeleteMarker)
+		{
+			NodePositions.Add(ParsedNode.NodeGuid, ParsedNode.Pos);
+		}
+	}
+	if (!UFlowGraphRegrapher::RegraphFlowAsset(CreatedAsset, NodePositions))
+	{
+		OutErrorMessage = TEXT("Created the asset but failed to regraph it");
+		Result.Findings.Add(OutErrorMessage);
+		return false;
+	}
+
+	// Hold the create path to the same standard as the patch path: report what the asset shows, not
+	// what the import was asked to do. ImportFlowGraphFromDocument succeeding is not evidence that
+	// every connection took.
+	TArray<FFlowGraphParsedConnection> ExpectedConnections;
+	ExpectedConnections.Reserve(ExecutionPlan.AllParsedConnections.Num());
+	for (const FFlowGraphParsedConnection& ParsedConnection : ExecutionPlan.AllParsedConnections)
+	{
+		if (!ParsedConnection.bIsDeleteMarker)
+		{
+			ExpectedConnections.Add(ParsedConnection);
+		}
+	}
+
+	TArray<FString> VerifiedConnectionsAdded, NotLandedConnections;
+	FFlowGraphReconciler::VerifyConnectionsLanded(CreatedAsset, ExpectedConnections, VerifiedConnectionsAdded, NotLandedConnections);
+	for (const FString& NotLandedLabel : NotLandedConnections)
+	{
+		Result.Findings.Add(FString::Printf(TEXT("Requested connection did not land: %s"), *NotLandedLabel));
+	}
+	Result.Plan.ConnectionsAdded = MoveTemp(VerifiedConnectionsAdded);
+
 	return true;
 }

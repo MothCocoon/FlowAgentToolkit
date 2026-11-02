@@ -353,52 +353,6 @@ FString UFlowGraphExporter::SerializeDocumentToJson(const FFlowAgentDocument& Do
 	return JsonString;
 }
 
-// True when Object is a subobject this property owns rather than a shared asset it merely points
-// at. Ownership is what makes the bare path unusable in an exported document, so that - not the
-// property flags alone - is the test.
-bool UFlowGraphExporter::IsInstancedSubobjectValue(const FObjectProperty& ObjectProperty, const UObject& Object)
-{
-	if (Object.IsAsset() || Object.HasAnyFlags(RF_ClassDefaultObject))
-	{
-		return false;
-	}
-
-	const bool bDeclaredInstanced = ObjectProperty.HasAnyPropertyFlags(CPF_InstancedReference | CPF_ExportObject)
-		|| (ObjectProperty.PropertyClass && ObjectProperty.PropertyClass->HasAnyClassFlags(CLASS_EditInlineNew));
-
-	return bDeclaredInstanced && Object.GetOuter() != nullptr && !Object.GetOuter()->IsA<UPackage>();
-}
-
-// Emits "ClassPath(Field=Value,...)" for an owned subobject, listing only the properties that
-// differ from the class default so the document stays as small as the rest of the FlowAgent grammar.
-FString UFlowGraphExporter::ExportInstancedSubobject(const UObject& Object)
-{
-	const UClass* Class = Object.GetClass();
-	const UObject* Defaults = Class->GetDefaultObject();
-
-	TArray<FString> Fields;
-	for (TFieldIterator<FProperty> PropertyIterator(Class); PropertyIterator; ++PropertyIterator)
-	{
-		FProperty* Property = *PropertyIterator;
-		if (!Property->HasAnyPropertyFlags(CPF_Edit) || Property->HasAnyPropertyFlags(CPF_Transient | CPF_EditConst))
-		{
-			continue;
-		}
-
-		const void* ValuePtr = Property->ContainerPtrToValuePtr<void>(&Object);
-		const void* DefaultPtr = Property->ContainerPtrToValuePtr<void>(Defaults);
-		if (Property->Identical(ValuePtr, DefaultPtr))
-		{
-			continue;
-		}
-
-		Fields.Add(FString::Printf(TEXT("%s=%s"),
-			*Property->GetName(), *GetPropertyValueAsString(Property, ValuePtr)));
-	}
-
-	return FString::Printf(TEXT("%s(%s)"), *Class->GetPathName(), *FString::Join(Fields, TEXT(",")));
-}
-
 FString UFlowGraphExporter::GetPropertyValueAsString(const FProperty* Property, const void* ValuePtr)
 {
 	if (!Property || !ValuePtr)
@@ -499,6 +453,52 @@ FString UFlowGraphExporter::GetPropertyValueAsString(const FProperty* Property, 
 	FString ExportedText;
 	Property->ExportTextItem_Direct(ExportedText, ValuePtr, ValuePtr, nullptr, PPF_None);
 	return ExportedText;
+}
+
+// True when Object is a subobject this property owns rather than a shared asset it merely points
+// at. Ownership is what makes the bare path unusable in an exported document, so that - not the
+// property flags alone - is the test.
+bool UFlowGraphExporter::IsInstancedSubobjectValue(const FObjectProperty& ObjectProperty, const UObject& Object)
+{
+	if (Object.IsAsset() || Object.HasAnyFlags(RF_ClassDefaultObject))
+	{
+		return false;
+	}
+
+	const bool bDeclaredInstanced = ObjectProperty.HasAnyPropertyFlags(CPF_InstancedReference | CPF_ExportObject)
+		|| (ObjectProperty.PropertyClass && ObjectProperty.PropertyClass->HasAnyClassFlags(CLASS_EditInlineNew));
+
+	return bDeclaredInstanced && Object.GetOuter() != nullptr && !Object.GetOuter()->IsA<UPackage>();
+}
+
+// Emits "ClassPath(Field=Value,...)" for an owned subobject, listing only the properties that
+// differ from the class default so the document stays as small as the rest of the FlowAgent grammar.
+FString UFlowGraphExporter::ExportInstancedSubobject(const UObject& Object)
+{
+	const UClass* Class = Object.GetClass();
+	const UObject* Defaults = Class->GetDefaultObject();
+
+	TArray<FString> Fields;
+	for (TFieldIterator<FProperty> PropertyIterator(Class); PropertyIterator; ++PropertyIterator)
+	{
+		FProperty* Property = *PropertyIterator;
+		if (!Property->HasAnyPropertyFlags(CPF_Edit) || Property->HasAnyPropertyFlags(CPF_Transient | CPF_EditConst))
+		{
+			continue;
+		}
+
+		const void* ValuePtr = Property->ContainerPtrToValuePtr<void>(&Object);
+		const void* DefaultPtr = Property->ContainerPtrToValuePtr<void>(Defaults);
+		if (Property->Identical(ValuePtr, DefaultPtr))
+		{
+			continue;
+		}
+
+		Fields.Add(FString::Printf(TEXT("%s=%s"),
+			*Property->GetName(), *GetPropertyValueAsString(Property, ValuePtr)));
+	}
+
+	return FString::Printf(TEXT("%s(%s)"), *Class->GetPathName(), *FString::Join(Fields, TEXT(",")));
 }
 
 FString UFlowGraphExporter::GetPinTypeName(const FFlowPin& Pin)

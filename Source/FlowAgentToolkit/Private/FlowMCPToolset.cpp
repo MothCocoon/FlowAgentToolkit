@@ -673,6 +673,30 @@ namespace
 
 }
 
+FFlowMCPListFlowAssetTypesResult UFlowMCPToolset::ListFlowAssetTypes(
+	const FFlowMCPListFlowAssetTypesRequest& Request)
+{
+	FFlowMCPListFlowAssetTypesResult Result;
+
+	TArray<FFlowCatalogAssetTypeRow> Rows;
+	UFlowCatalogQuery::ListAssetTypes(Rows);
+
+	for (const FFlowCatalogAssetTypeRow& Row : Rows)
+	{
+		FFlowMCPFlowAssetTypeSummary Summary;
+		Summary.ClassName = Row.ClassName;
+		Summary.ClassPath = Row.ClassPath;
+		Summary.Description = Row.Description;
+		Summary.Keywords = Row.Keywords;
+		Summary.AllowedNodeCount = Row.AllowedNodeCount;
+		Summary.AllowedAddonCount = Row.AllowedAddonCount;
+		Result.AssetTypes.Add(Summary);
+	}
+
+	Result.FoundCount = Result.AssetTypes.Num();
+	return Result;
+}
+
 FFlowMCPCheckAddonAttachmentEligibilityResult UFlowMCPToolset::CheckAddonAttachmentEligibility(
 	const FFlowMCPCheckAddonAttachmentEligibilityRequest& Request)
 {
@@ -796,30 +820,6 @@ namespace
 	}
 }
 
-FFlowMCPListFlowAssetTypesResult UFlowMCPToolset::ListFlowAssetTypes(
-	const FFlowMCPListFlowAssetTypesRequest& Request)
-{
-	FFlowMCPListFlowAssetTypesResult Result;
-
-	TArray<FFlowCatalogAssetTypeRow> Rows;
-	UFlowCatalogQuery::ListAssetTypes(Rows);
-
-	for (const FFlowCatalogAssetTypeRow& Row : Rows)
-	{
-		FFlowMCPFlowAssetTypeSummary Summary;
-		Summary.ClassName = Row.ClassName;
-		Summary.ClassPath = Row.ClassPath;
-		Summary.Description = Row.Description;
-		Summary.Keywords = Row.Keywords;
-		Summary.AllowedNodeCount = Row.AllowedNodeCount;
-		Summary.AllowedAddonCount = Row.AllowedAddonCount;
-		Result.AssetTypes.Add(Summary);
-	}
-
-	Result.FoundCount = Result.AssetTypes.Num();
-	return Result;
-}
-
 FFlowMCPFindFlowNodeTypesResult UFlowMCPToolset::FindFlowNodeTypes(
 	const FFlowMCPFindFlowNodeTypesRequest& Request)
 {
@@ -915,40 +915,6 @@ FFlowMCPSetFlowAgentDocResult UFlowMCPToolset::SetFlowAgentDoc(
 	Result.bPersisted = WriteResult.bPersisted;
 	Result.SourceSnippet = WriteResult.SourceSnippet;
 	Result.Note = WriteResult.Note;
-	Result.Mutation = MutationReport;
-	return Result;
-}
-
-FFlowMCPCreateFlowNodeBlueprintResult UFlowMCPToolset::CreateFlowNodeBlueprint(
-	const FFlowMCPCreateFlowNodeBlueprintRequest& Request)
-{
-	FFlowMCPCreateFlowNodeBlueprintResult Result;
-
-	FFlowNodeBlueprintCreateRequest CreateRequest;
-	CreateRequest.PackagePath = Request.PackagePath;
-	CreateRequest.AssetName = Request.AssetName;
-	CreateRequest.ParentClass = Request.ParentClass;
-	CreateRequest.DisplayName = Request.DisplayName;
-	CreateRequest.Description = Request.Description;
-
-	FFlowMCPMutationReport MutationReport;
-	const FFlowNodeBlueprintCreateResult CreateResult =
-		FFlowNodeBlueprintCreator::Create(CreateRequest, Request.Mutation, MutationReport);
-
-	if (!CreateResult.ErrorMessage.IsEmpty())
-	{
-		RaiseFlowGraphToolError(CreateResult.ErrorMessage);
-		return Result;
-	}
-
-	Result.AssetPath = CreateResult.AssetPath;
-	Result.AssetClassPath = CreateResult.AssetClassPath;
-	Result.GeneratedClassPath = CreateResult.GeneratedClassPath;
-	Result.ParentClassPath = CreateResult.ParentClassPath;
-	Result.bCompiled = CreateResult.bCompiled;
-	Result.CompileErrors = CreateResult.CompileErrors;
-	Result.bResolvedInCatalog = CreateResult.bResolvedInCatalog;
-	Result.Note = CreateResult.Note;
 	Result.Mutation = MutationReport;
 	return Result;
 }
@@ -1327,6 +1293,40 @@ FFlowMCPFindOrCreateFlowNodeResult UFlowMCPToolset::FindOrCreateFlowNode(
 	return Result;
 }
 
+FFlowMCPCreateFlowNodeBlueprintResult UFlowMCPToolset::CreateFlowNodeBlueprint(
+	const FFlowMCPCreateFlowNodeBlueprintRequest& Request)
+{
+	FFlowMCPCreateFlowNodeBlueprintResult Result;
+
+	FFlowNodeBlueprintCreateRequest CreateRequest;
+	CreateRequest.PackagePath = Request.PackagePath;
+	CreateRequest.AssetName = Request.AssetName;
+	CreateRequest.ParentClass = Request.ParentClass;
+	CreateRequest.DisplayName = Request.DisplayName;
+	CreateRequest.Description = Request.Description;
+
+	FFlowMCPMutationReport MutationReport;
+	const FFlowNodeBlueprintCreateResult CreateResult =
+		FFlowNodeBlueprintCreator::Create(CreateRequest, Request.Mutation, MutationReport);
+
+	if (!CreateResult.ErrorMessage.IsEmpty())
+	{
+		RaiseFlowGraphToolError(CreateResult.ErrorMessage);
+		return Result;
+	}
+
+	Result.AssetPath = CreateResult.AssetPath;
+	Result.AssetClassPath = CreateResult.AssetClassPath;
+	Result.GeneratedClassPath = CreateResult.GeneratedClassPath;
+	Result.ParentClassPath = CreateResult.ParentClassPath;
+	Result.bCompiled = CreateResult.bCompiled;
+	Result.CompileErrors = CreateResult.CompileErrors;
+	Result.bResolvedInCatalog = CreateResult.bResolvedInCatalog;
+	Result.Note = CreateResult.Note;
+	Result.Mutation = MutationReport;
+	return Result;
+}
+
 FFlowMCPAutoFormatFlowGraphResult UFlowMCPToolset::AutoFormatFlowGraph(
 	const FFlowMCPAutoFormatFlowGraphRequest& Request)
 {
@@ -1389,80 +1389,6 @@ FFlowMCPAutoFormatFlowGraphResult UFlowMCPToolset::AutoFormatFlowGraph(
 	}
 
 	Result.UnresolvedGuids = UnresolvedGuids;
-	return Result;
-}
-
-FFlowMCPReconstructFlowGraphResult UFlowMCPToolset::ReconstructFlowGraph(
-	const FFlowMCPReconstructFlowGraphRequest& Request)
-{
-	FFlowMCPReconstructFlowGraphResult Result;
-	if (Request.TargetAssetPath.IsEmpty())
-	{
-		RaiseFlowGraphToolError(TEXT("ReconstructFlowGraph: TargetAssetPath cannot be empty."));
-		return Result;
-	}
-
-	UFlowAsset* FlowAsset = LoadFlowAssetOrNull(Request.TargetAssetPath);
-	if (!FlowAsset)
-	{
-		RaiseFlowGraphToolError(FString::Printf(TEXT("ReconstructFlowGraph: Failed to load asset at path: %s"), *Request.TargetAssetPath));
-		return Result;
-	}
-
-	FFlowMCPMutationContext MutationContext(Request.Mutation);
-	if (!BeginMutation(FlowAsset, MutationContext))
-	{
-		return Result;
-	}
-
-	MutationContext.Modify(FlowAsset);
-
-	// Counted before the rebuild, which is what removes them - reported so a caller can tell a
-	// repair from a no-op rebuild.
-	const int32 OrphanedEditorNodesRemoved = UFlowGraphRegrapher::PruneOrphanedEditorNodes(FlowAsset);
-
-	if (!UFlowGraphRegrapher::RegraphFlowAsset(FlowAsset))
-	{
-		MutationContext.Abort();
-		RaiseFlowGraphToolError(FString::Printf(
-			TEXT("ReconstructFlowGraph: Failed to rebuild the editor graph for '%s'."),
-			*Request.TargetAssetPath));
-		return Result;
-	}
-
-	FlowAsset->RebuildCustomInterfaceLists();
-
-	if (!CompleteMutation(FlowAsset, MutationContext, Result.Mutation))
-	{
-		return Result;
-	}
-
-	Result.AssetPath = Request.TargetAssetPath;
-	Result.NodeCount = FlowAsset->GetNodes().Num();
-	Result.OrphanedEditorNodesRemoved = OrphanedEditorNodesRemoved;
-	UFlowGraphRegrapher::CollectGraphParityIssues(FlowAsset, Result.GraphIntegrityIssues);
-	return Result;
-}
-
-FFlowMCPExportFlowCatalogResult UFlowMCPToolset::ExportFlowCatalog(
-	const FFlowMCPExportFlowCatalogRequest& Request)
-{
-	FFlowMCPExportFlowCatalogResult Result;
-	if (Request.OutputFilePath.IsEmpty())
-	{
-		RaiseFlowGraphToolError(TEXT("ExportFlowCatalog: OutputFilePath cannot be empty."));
-		return Result;
-	}
-
-	Result.OutputFilePath = Request.OutputFilePath;
-	Result.bSucceeded = UFlowCatalogQuery::ExportFlowCatalogToFile(Request.OutputFilePath, Request.AssetClassName);
-	if (!Result.bSucceeded)
-	{
-		RaiseFlowGraphToolError(FString::Printf(
-			TEXT("ExportFlowCatalog: Failed to export catalog to '%s'."),
-			*Request.OutputFilePath));
-	}
-
 	return Result;
 }
 
@@ -2155,5 +2081,79 @@ FFlowMCPSearchFlowAssetsResult UFlowMCPToolset::SearchFlowAssets(
 	Result.Flags = static_cast<int32>(static_cast<uint32>(SearchQuery.Flags));
 	Result.PinDirection = Request.PinDirection.ToLower();
 	Result.PinConnection = Request.PinConnection.ToLower();
+	return Result;
+}
+
+FFlowMCPReconstructFlowGraphResult UFlowMCPToolset::ReconstructFlowGraph(
+	const FFlowMCPReconstructFlowGraphRequest& Request)
+{
+	FFlowMCPReconstructFlowGraphResult Result;
+	if (Request.TargetAssetPath.IsEmpty())
+	{
+		RaiseFlowGraphToolError(TEXT("ReconstructFlowGraph: TargetAssetPath cannot be empty."));
+		return Result;
+	}
+
+	UFlowAsset* FlowAsset = LoadFlowAssetOrNull(Request.TargetAssetPath);
+	if (!FlowAsset)
+	{
+		RaiseFlowGraphToolError(FString::Printf(TEXT("ReconstructFlowGraph: Failed to load asset at path: %s"), *Request.TargetAssetPath));
+		return Result;
+	}
+
+	FFlowMCPMutationContext MutationContext(Request.Mutation);
+	if (!BeginMutation(FlowAsset, MutationContext))
+	{
+		return Result;
+	}
+
+	MutationContext.Modify(FlowAsset);
+
+	// Counted before the rebuild, which is what removes them - reported so a caller can tell a
+	// repair from a no-op rebuild.
+	const int32 OrphanedEditorNodesRemoved = UFlowGraphRegrapher::PruneOrphanedEditorNodes(FlowAsset);
+
+	if (!UFlowGraphRegrapher::RegraphFlowAsset(FlowAsset))
+	{
+		MutationContext.Abort();
+		RaiseFlowGraphToolError(FString::Printf(
+			TEXT("ReconstructFlowGraph: Failed to rebuild the editor graph for '%s'."),
+			*Request.TargetAssetPath));
+		return Result;
+	}
+
+	FlowAsset->RebuildCustomInterfaceLists();
+
+	if (!CompleteMutation(FlowAsset, MutationContext, Result.Mutation))
+	{
+		return Result;
+	}
+
+	Result.AssetPath = Request.TargetAssetPath;
+	Result.NodeCount = FlowAsset->GetNodes().Num();
+	Result.OrphanedEditorNodesRemoved = OrphanedEditorNodesRemoved;
+	UFlowGraphRegrapher::CollectGraphParityIssues(FlowAsset, Result.GraphIntegrityIssues);
+	return Result;
+}
+
+FFlowMCPExportFlowCatalogResult UFlowMCPToolset::ExportFlowCatalog(
+	const FFlowMCPExportFlowCatalogRequest& Request)
+{
+	FFlowMCPExportFlowCatalogResult Result;
+	if (Request.OutputFilePath.IsEmpty())
+	{
+		RaiseFlowGraphToolError(TEXT("ExportFlowCatalog: OutputFilePath cannot be empty."));
+		return Result;
+	}
+
+	Result.OutputFilePath = Request.OutputFilePath;
+	Result.bSucceeded = UFlowCatalogQuery::ExportFlowCatalogToFile(Request.OutputFilePath, Request.AssetClassName);
+	if (!Result.bSucceeded)
+	{
+		RaiseFlowGraphToolError(FString::Printf(
+			TEXT("ExportFlowCatalog: Failed to export catalog to '%s'."),
+			*Request.OutputFilePath));
+	}
+
 	return Result;
 }
