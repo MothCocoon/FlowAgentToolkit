@@ -1,6 +1,6 @@
-﻿// Copyright https://github.com/MothCocoon/FlowGraph/graphs/contributors
-
+// Copyright https://github.com/MothCocoon/FlowGraph/graphs/contributors
 #include "FlowCatalogQuery.h"
+
 #include "FlowLogChannels.h"
 #include "FlowAsset.h"
 #include "FlowNodeUsageIndex.h"

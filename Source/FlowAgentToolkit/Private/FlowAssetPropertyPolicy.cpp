@@ -1,5 +1,4 @@
 // Copyright https://github.com/MothCocoon/FlowGraph/graphs/contributors
-
 #include "FlowAssetPropertyPolicy.h"
 
 #include "FlowAsset.h"

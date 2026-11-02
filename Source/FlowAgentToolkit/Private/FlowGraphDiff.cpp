@@ -1,6 +1,6 @@
 // Copyright https://github.com/MothCocoon/FlowGraph/graphs/contributors
-
 #include "FlowGraphDiff.h"
+
 #include "FlowGraphImporter.h"
 #include "FlowAgentConverter.h"
 #include "FlowAgentDocument.h"

@@ -1,5 +1,4 @@
 // Copyright https://github.com/MothCocoon/FlowGraph/graphs/contributors
-
 #pragma once
 
 // FlowAgent v2 JSON mutation documents used by FlowGraphValidation.spec.cpp. Each targets the
