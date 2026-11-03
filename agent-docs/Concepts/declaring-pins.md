@@ -33,7 +33,8 @@ single in/out most nodes have. To declare your own:
 
 ## 2. Data pins (typed values)
 
-A data pin carries a typed value. Supported types (`EFlowPinType`): `Bool`, `Int`, `Float`, `Name`,
+A data pin carries a typed value. Standard registered types (`FFlowPinTypeNamesStandard`):
+`Bool`, `Int`, `Int64`, `Float`, `Double`, `Name`,
 `String`, `Text`, `Enum`, `Vector`, `Rotator`, `Transform`, `GameplayTag`, `GameplayTagContainer`,
 `InstancedStruct`, `Object`, `Class`. Each can be **Single** or **Array** (`EFlowDataMultiType` /
 `EPinContainerType`).
@@ -80,10 +81,6 @@ they double as a convenient value container.
 > **This is the C++-vs-Blueprint difference in one sentence:** C++ can annotate any property
 > (3a); Blueprint instead declares a `FFlowDataPinValue_*`-typed property (3b). Both
 > produce the same auto-generated pin.
-
-- **Legacy:** `FFlowDataPinInputProperty_*` / `FFlowDataPinOutputProperty_*` are an older wrapper
-  pathway (`#FlowDataPinLegacy`) - recognize them in existing code, prefer `FFlowDataPinValue_*` for
-  new work.
 
 ### 3c. Under the hood
 
