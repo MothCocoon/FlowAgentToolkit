@@ -104,9 +104,9 @@ reason to use a sub-graph.
 - **Isolating a self-contained sub-behavior with its own local state** - a sub-graph is a distinct
   `FlowAsset` instance; anything it does is spatially and temporally contained inside it, which can
   make a self-contained mini-behavior (e.g. a shared side-quest chain, or a reusable lifecycle
-  stage) easier to reason about than the same logic inlined into a larger graph. A project's own
-  domain-specific Pattern articles may document a shipped example of this shape - check there for
-  a real exemplar before hand-writing one.
+  stage) easier to reason about than the same logic inlined into a larger graph. An official
+  extension's Pattern articles may document a shipped example of this shape - check there for a
+  real exemplar before hand-writing one.
 - **Keep inline when**: the logic is small, used exactly once, and splitting it out would only add
   an extra asset to navigate without a real reuse or readability win.
 

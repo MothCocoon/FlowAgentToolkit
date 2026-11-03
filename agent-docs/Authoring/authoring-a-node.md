@@ -115,10 +115,10 @@ pasted, not just the one instance in front of it.
 - Prefer `TentativeAccept` (not a hard accept) so other conditions and the other side's vote still
   get to weigh in; use `Reject` only to actively forbid.
 
-## Project-layer note
+## Extension-layer note
 
-An extension plugin or consuming project documents its own base classes and dynamic pin behavior
-beside the code that defines them.
+The official plugin index links to each extension's base-class and dynamic-pin articles in this
+knowledge base.
 
 ## See also
 
