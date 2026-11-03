@@ -23,10 +23,15 @@ Call `FindFlowNodeTypes` with the target asset class and a query for the desired
 Use the returned class descriptions and reflected shape to select a node or addon, then follow the
 generic Flow authoring workflow.
 
+Some key extensions to FlowActors can be found in AIFlowActors plugin (also official), which adds 
+AIModule-specific support for EQS and blackboard to FlowActors classes.
+
 ## Concepts
 
 - $KB:flow:concept:spawn-and-fight-actors - when to use the one-shot Spawn Actors node or the
   tracked Fight Actors node, and how selectors, spawn records, cohorts, and reinforcement fit together.
+- $KB:flow:concept:reinforcement-configuration - configure reinforcement timing, triggers, spawn
+  methods, round limits, and completion using sanitized FlowAgent JSON examples.
 
 ## See also
 

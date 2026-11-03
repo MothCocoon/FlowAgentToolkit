@@ -20,36 +20,10 @@
 #include "UObject/PropertyPathName.h"
 #include "Templates/Function.h"
 #include "Templates/UniquePtr.h"
+#include "Misc/EngineVersionComparison.h"
 #include "Misc/PackageName.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Graph/FlowGraph.h"
-
-namespace
-{
-	// Stabilize reflected writes so repeated imports dispatch property callbacks in a predictable order.
-	bool IsAddOnPropertyChangeBefore(
-		const TPair<FString, FString>& Left,
-		const TPair<FString, FString>& Right)
-	{
-		return Left.Key < Right.Key;
-	}
-}
-
-static FName ParsePinNameToken(const FString& RawToken)
-{
-	// A pin name is normally free text with incidental whitespace trimmed - but exactly one class
-	// declares an intentionally-blank pin name (a single-space-named exec pin, seen in some
-	// project-specific nodes), and trimming that down to an empty string collapses it to NAME_None, which
-	// then fails to resolve against the real pin. If trimming would erase an otherwise non-empty
-	// token, the token *was* meaningful whitespace - fall back to a single space rather than losing
-	// it, matching that class's own sentinel value.
-	const FString Trimmed = RawToken.TrimStartAndEnd();
-	if (Trimmed.IsEmpty() && !RawToken.IsEmpty())
-	{
-		return FName(TEXT(" "));
-	}
-	return FName(*Trimmed);
-}
 
 UFlowAsset* UFlowGraphImporter::ImportFlowGraphFromDocument(
 	const FString& TargetAssetPath,
@@ -236,135 +210,6 @@ bool UFlowGraphImporter::PopulateFlowAssetFromDocument(
 	return true;
 }
 
-bool UFlowGraphImporter::ParsePinDecl(const FString& PinDecl, FName& OutPinName, FString& OutPinType, FString& OutSubCategoryPath)
-{
-	// Trim only the trailing edge here, for the same reason ParseNodes's pin-line extraction does -
-	// the leading edge can legitimately be (part of) an intentionally-blank pin's name, and a full
-	// trim would erase it before the " [" name/type boundary below is ever located.
-	FString Trimmed = PinDecl;
-	Trimmed.TrimEndInline();
-	if (Trimmed.IsEmpty())
-	{
-		return false;
-	}
-
-	FString PinName;
-	FString BracketContent;
-	if (Trimmed.Split(TEXT(" ["), &PinName, &BracketContent))
-	{
-		BracketContent.RemoveFromEnd(TEXT("]"));
-		BracketContent = BracketContent.TrimStartAndEnd();
-
-		// Sub-category form: "PinType:/Object/Path" - split on first ':'
-		FString TypePart;
-		FString SubCatPart;
-		if (BracketContent.Split(TEXT(":"), &TypePart, &SubCatPart))
-		{
-			OutPinType          = TypePart.TrimStartAndEnd();
-			OutSubCategoryPath  = SubCatPart.TrimStartAndEnd();
-		}
-		else
-		{
-			OutPinType         = BracketContent;
-			OutSubCategoryPath = FString();
-		}
-		OutPinName = ParsePinNameToken(PinName);
-	}
-	else
-	{
-		// No " [Type]" suffix at all (bare name) - this shape never carries the blank-pin ambiguity
-		// (the real format always includes a type annotation), so a normal full trim is correct here.
-		OutPinName         = FName(*Trimmed.TrimStartAndEnd());
-		OutPinType         = FString();
-		OutSubCategoryPath = FString();
-	}
-
-	return !OutPinName.IsNone();
-}
-
-UClass* UFlowGraphImporter::ResolveNodeClass(const FString& NodeType)
-{
-	UClass* NodeClass = ResolveNodeClassForQuery(NodeType);
-
-	FString RejectionReason;
-	if (IsClassFromNonFlowBlueprint(NodeClass, RejectionReason))
-	{
-		UE_LOG(LogFlow, Warning, TEXT("ResolveNodeClass rejected '%s': %s"), *NodeType, *RejectionReason);
-		return nullptr;
-	}
-
-	return NodeClass;
-}
-
-UClass* UFlowGraphImporter::ResolveNodeClassForQuery(const FString& NodeType)
-{
-	UClass* NodeClass = nullptr;
-
-	// Full path (contains /Script/ or a dot) - try direct load
-	if (NodeType.Contains(TEXT("/Script/")) || NodeType.Contains(TEXT(".")))
-	{
-		NodeClass = LoadObject<UClass>(nullptr, *NodeType);
-	}
-
-	// Short name - try /Script/Flow prefix
-	if (!NodeClass)
-	{
-		NodeClass = FindObject<UClass>(nullptr, *FString::Printf(TEXT("/Script/Flow.%s"), *NodeType));
-	}
-	if (!NodeClass)
-	{
-		NodeClass = LoadObject<UClass>(nullptr, *FString::Printf(TEXT("/Script/Flow.%s"), *NodeType));
-	}
-
-	// Last resort: as-is
-	if (!NodeClass)
-	{
-		NodeClass = FindObject<UClass>(nullptr, *NodeType);
-	}
-
-	return NodeClass;
-}
-
-bool UFlowGraphImporter::IsClassFromNonFlowBlueprint(const UClass* InClass, FString& OutReason)
-{
-	OutReason.Reset();
-
-	if (!InClass)
-	{
-		return false;
-	}
-
-#if WITH_EDITORONLY_DATA
-	// Native and AngelScript classes carry no generating Blueprint, so there is nothing to police.
-	// Fail open for them rather than guessing, so a missing ClassGeneratedBy can never block a
-	// legitimate compiled-in node type.
-	const UBlueprint* GeneratingBlueprint = Cast<UBlueprint>(InClass->ClassGeneratedBy);
-	if (!GeneratingBlueprint)
-	{
-		return false;
-	}
-
-	// UFlowNodeBlueprint and UFlowNodeAddOnBlueprint are siblings under UBlueprint, not a shared
-	// base, so both must be named explicitly - testing only the node form would reject every addon.
-	if (GeneratingBlueprint->IsA<UFlowNodeBlueprint>() || GeneratingBlueprint->IsA<UFlowNodeAddOnBlueprint>())
-	{
-		return false;
-	}
-
-	OutReason = FString::Printf(
-		TEXT("'%s' is generated by '%s', a plain %s rather than a FlowNodeBlueprint or ")
-		TEXT("FlowNodeAddOnBlueprint. It compiles, but the Flow palette and the FlowAgent catalog both ")
-		TEXT("gather by asset class, so neither can see it. Recreate it with the ")
-		TEXT("CreateFlowNodeBlueprint op."),
-		*InClass->GetPathName(),
-		*GeneratingBlueprint->GetPathName(),
-		*GeneratingBlueprint->GetClass()->GetName());
-	return true;
-#else
-	return false;
-#endif // WITH_EDITORONLY_DATA
-}
-
 bool UFlowGraphImporter::CreateFlowNodes(UFlowAsset* FlowAsset, const TArray<FFlowGraphParsedNode>& ParsedNodes, TMap<FGuid, UFlowNode*>& OutNodeMap, FString& OutErrorMessage)
 {
 	// Use reflection to access the private Nodes map
@@ -539,427 +384,6 @@ bool UFlowGraphImporter::SetupConnections(UFlowAsset* FlowAsset, const TMap<FGui
 		}
 	}
 
-	return true;
-}
-
-bool UFlowGraphImporter::CreateNodeAddOns(
-	const TMap<FGuid, UFlowNode*>& NodeMap,
-	const TArray<FFlowGraphParsedNode>& ParsedNodes,
-	FString& OutErrorMessage)
-{
-	// Preserve the convenience entry point while collecting every callback until all node trees exist.
-	FFlowPendingAddOnPropertyChanges PendingPropertyChanges;
-	if (!CreateNodeAddOns(NodeMap, ParsedNodes, PendingPropertyChanges, OutErrorMessage))
-	{
-		return false;
-	}
-
-	TArray<UFlowNodeBase*> RootOwners;
-	for (const TPair<FGuid, UFlowNode*>& NodePair : NodeMap)
-	{
-		RootOwners.Add(NodePair.Value);
-	}
-	// Dispatch from the roots so nested children run before their owning AddOns.
-	return DispatchPendingAddOnPropertyChanges(RootOwners, PendingPropertyChanges, OutErrorMessage);
-}
-
-bool UFlowGraphImporter::CreateNodeAddOns(
-	const TMap<FGuid, UFlowNode*>& NodeMap,
-	const TArray<FFlowGraphParsedNode>& ParsedNodes,
-	FFlowPendingAddOnPropertyChanges& OutPendingPropertyChanges,
-	FString& OutErrorMessage)
-{
-	// Reconcile each node's whole parsed subtree into the shared pending set.
-	for (const FFlowGraphParsedNode& ParsedNode : ParsedNodes)
-	{
-		if (ParsedNode.AddOns.IsEmpty())
-		{
-			continue;
-		}
-
-		UFlowNode* OwnerNode = NodeMap.FindRef(ParsedNode.NodeGuid);
-		if (!OwnerNode)
-		{
-			OutErrorMessage = FString::Printf(TEXT("CreateNodeAddOns: Could not find node for GUID %s"), *ParsedNode.NodeGuid.ToString());
-			return false;
-		}
-
-		if (!CreateAddOnsRecursive(OwnerNode, ParsedNode.AddOns, OutPendingPropertyChanges, OutErrorMessage))
-		{
-			return false;
-		}
-	}
-
-	return true;
-}
-
-bool UFlowGraphImporter::CreateAddOnsRecursive(
-	UFlowNodeBase* Owner,
-	const TArray<FFlowGraphParsedNodeAddOn>& ParsedAddOns,
-	FString& OutErrorMessage)
-{
-	FFlowPendingAddOnPropertyChanges PendingPropertyChanges;
-	if (!CreateAddOnsRecursive(Owner, ParsedAddOns, PendingPropertyChanges, OutErrorMessage))
-	{
-		return false;
-	}
-
-	TArray<UFlowNodeBase*> RootOwners;
-	RootOwners.Add(Owner);
-	return DispatchPendingAddOnPropertyChanges(RootOwners, PendingPropertyChanges, OutErrorMessage);
-}
-
-bool UFlowGraphImporter::CreateAddOnsRecursive(
-	UFlowNodeBase* Owner,
-	const TArray<FFlowGraphParsedNodeAddOn>& ParsedAddOns,
-	FFlowPendingAddOnPropertyChanges& OutPendingPropertyChanges,
-	FString& OutErrorMessage)
-{
-	if (ParsedAddOns.IsEmpty())
-	{
-		return true;
-	}
-
-	// Capture the owner before touching its reflected AddOns array so transaction undo includes attachment.
-	if (!Owner->HasAnyFlags(RF_Transient))
-	{
-		Owner->SetFlags(RF_Transactional);
-		Owner->Modify();
-	}
-
-	FArrayProperty* AddOnsProperty = FindFProperty<FArrayProperty>(UFlowNodeBase::StaticClass(), TEXT("AddOns"));
-	if (!AddOnsProperty)
-	{
-		OutErrorMessage = TEXT("CreateAddOnsRecursive: Could not find AddOns property on UFlowNodeBase");
-		return false;
-	}
-
-	FObjectProperty* ElemProp = CastField<FObjectProperty>(AddOnsProperty->Inner);
-	if (!ElemProp)
-	{
-		OutErrorMessage = TEXT("CreateAddOnsRecursive: AddOns array element property is not an object property");
-		return false;
-	}
-
-	for (const FFlowGraphParsedNodeAddOn& ParsedAddOn : ParsedAddOns)
-	{
-		if (ParsedAddOn.bIsDeleteMarker)
-		{
-			// Meaningless for a brand new owner - nothing to delete yet. Only relevant for
-			// FFlowGraphReconciler::ReconcileNodeAddOns on an already-existing owner.
-			continue;
-		}
-
-		UClass* AddOnClass = nullptr;
-
-		if (ParsedAddOn.AddOnType.Contains(TEXT("/Script/")) || ParsedAddOn.AddOnType.Contains(TEXT(".")))
-		{
-			AddOnClass = LoadObject<UClass>(nullptr, *ParsedAddOn.AddOnType);
-		}
-
-		if (!AddOnClass)
-		{
-			AddOnClass = FindObject<UClass>(nullptr, *FString::Printf(TEXT("/Script/Flow.%s"), *ParsedAddOn.AddOnType));
-		}
-
-		if (!AddOnClass || !AddOnClass->IsChildOf(UFlowNodeAddOn::StaticClass()))
-		{
-			OutErrorMessage = FString::Printf(TEXT("CreateAddOnsRecursive: Could not find AddOn class: %s"), *ParsedAddOn.AddOnType);
-			return false;
-		}
-
-		// NewObject on an abstract class trips an engine-level
-		// ensure() rather than returning null, which crashes the editor session mid-import.
-		if (AddOnClass->HasAnyClassFlags(CLASS_Abstract))
-		{
-			OutErrorMessage = FString::Printf(TEXT("CreateAddOnsRecursive: AddOn class is abstract and cannot be instantiated: %s"), *ParsedAddOn.AddOnType);
-			return false;
-		}
-
-		UFlowNodeAddOn* NewAddOn = NewObject<UFlowNodeAddOn>(Owner, AddOnClass, NAME_None, RF_Transactional);
-		if (!NewAddOn)
-		{
-			OutErrorMessage = FString::Printf(TEXT("CreateAddOnsRecursive: Failed to create AddOn of type: %s"), *ParsedAddOn.AddOnType);
-			return false;
-		}
-
-		NewAddOn->SetGuid(ParsedAddOn.AddOnGuid.IsValid() ? ParsedAddOn.AddOnGuid : FGuid::NewGuid());
-
-		// Apply authored fields now, but defer their callbacks until all siblings and children are attached.
-		if (!SetAddOnProperties(NewAddOn, ParsedAddOn.Properties, OutPendingPropertyChanges, OutErrorMessage))
-		{
-			return false;
-		}
-
-		// Attach before descending so callbacks can later query the complete owner and sibling set.
-		// Re-acquire the helper each iteration because an earlier append may have reallocated the array.
-		void* AddOnsPtr = AddOnsProperty->ContainerPtrToValuePtr<void>(Owner);
-		FScriptArrayHelper AddOnsHelper(AddOnsProperty, AddOnsPtr);
-		const int32 NewIndex = AddOnsHelper.AddValue();
-		ElemProp->SetObjectPropertyValue(AddOnsHelper.GetRawPtr(NewIndex), NewAddOn);
-
-		if (!CreateAddOnsRecursive(NewAddOn, ParsedAddOn.AddOns, OutPendingPropertyChanges, OutErrorMessage))
-		{
-			return false;
-		}
-	}
-
-	return true;
-}
-
-namespace FlowAddOnPropertyChangeDetail
-{
-	// Find the struct to inspect after a property segment, including the element type of struct arrays.
-	const UStruct* FindNestedStruct(const FProperty* Property)
-	{
-		if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property))
-		{
-			return StructProperty->Struct;
-		}
-
-		if (const FArrayProperty* ArrayProperty = CastField<FArrayProperty>(Property))
-		{
-			if (const FStructProperty* InnerStructProperty = CastField<FStructProperty>(ArrayProperty->Inner))
-			{
-				return InnerStructProperty->Struct;
-			}
-		}
-
-		return nullptr;
-	}
-
-	bool BuildTypedPropertyPath(
-		UFlowNodeAddOn* AddOn,
-		const FString& ChangedPath,
-		TArray<FString>& OutPathSegments,
-		UE::FPropertyPathName& OutPropertyPath,
-		FString& OutErrorMessage)
-	{
-		// Resolve FlowAgent names to typed reflected segments so CoreUObject can construct the
-		// callback event used to refresh AddOn pin caches during preview and commit.
-		ChangedPath.ParseIntoArray(OutPathSegments, TEXT("."), true);
-		if (OutPathSegments.IsEmpty())
-		{
-			OutErrorMessage = FString::Printf(TEXT("Property path '%s' is empty"), *ChangedPath);
-			return false;
-		}
-
-		const UStruct* CurrentStruct = AddOn->GetClass();
-		FProperty* PreviousProperty = nullptr;
-		bool bPreviousPropertyNeedsArrayIndex = false;
-		for (const FString& PathSegment : OutPathSegments)
-		{
-			if (PathSegment.IsNumeric())
-			{
-				if (!PreviousProperty || !bPreviousPropertyNeedsArrayIndex)
-				{
-					OutErrorMessage = FString::Printf(
-						TEXT("Unexpected array index '%s' in property path '%s'"), *PathSegment, *ChangedPath);
-					return false;
-				}
-
-				OutPropertyPath.SetIndex(FCString::Atoi(*PathSegment));
-				CurrentStruct = FindNestedStruct(PreviousProperty);
-				bPreviousPropertyNeedsArrayIndex = false;
-				continue;
-			}
-
-			if (!CurrentStruct || bPreviousPropertyNeedsArrayIndex)
-			{
-				OutErrorMessage = FString::Printf(
-					TEXT("Cannot resolve property '%s' in path '%s'"), *PathSegment, *ChangedPath);
-				return false;
-			}
-
-			FProperty* Property = FindFProperty<FProperty>(CurrentStruct, *PathSegment);
-			if (!Property)
-			{
-				OutErrorMessage = FString::Printf(
-					TEXT("Could not find property '%s' in path '%s'"), *PathSegment, *ChangedPath);
-				return false;
-			}
-
-			UE::FPropertyPathNameSegment PropertySegment;
-			PropertySegment.Name = Property->GetFName();
-			PropertySegment.Type = UE::FPropertyTypeName(Property);
-			OutPropertyPath.Push(PropertySegment);
-
-			PreviousProperty = Property;
-			CurrentStruct = FindNestedStruct(Property);
-			bPreviousPropertyNeedsArrayIndex =
-				CastField<FArrayProperty>(Property) != nullptr || Property->ArrayDim > 1;
-		}
-
-		return true;
-	}
-
-	bool ActivatePropertyChangeChain(
-		UFlowNodeAddOn* AddOn,
-		const FString& ChangedPath,
-		const TArray<FString>& PathSegments,
-		FProperty* ActiveProperty,
-		FEditPropertyChain& PropertyChain,
-		TSharedPtr<FPropertyChangedChainEvent>& OutChangeEvent,
-		FString& OutErrorMessage)
-	{
-		// Mark the leaf and root member active so callbacks see the same edit context as Details edits.
-		FProperty* ActiveMemberProperty = FindFProperty<FProperty>(AddOn->GetClass(), *PathSegments[0]);
-		if (!ActiveMemberProperty || !PropertyChain.SetActivePropertyNode(ActiveProperty) ||
-			!PropertyChain.SetActiveMemberPropertyNode(ActiveMemberProperty))
-		{
-			OutErrorMessage = FString::Printf(
-				TEXT("Could not activate the property-change chain for '%s' on AddOn %s"),
-				*ChangedPath, *AddOn->GetClass()->GetName());
-			return false;
-		}
-
-		OutChangeEvent->SetActiveMemberProperty(ActiveMemberProperty);
-		return true;
-	}
-
-	bool DispatchChangedPropertyPath(
-		UFlowNodeAddOn* AddOn,
-		const FString& ChangedPath,
-		FString& OutErrorMessage)
-	{
-		TArray<FString> PathSegments;
-		UE::FPropertyPathName PropertyPath;
-		if (!BuildTypedPropertyPath(AddOn, ChangedPath, PathSegments, PropertyPath, OutErrorMessage))
-		{
-			return false;
-		}
-
-		UE::FPropertyPathNameResolver PropertyPathResolver(PropertyPath, AddOn);
-		TSharedPtr<FPropertyChangedChainEvent> ChangeEvent;
-		if (!PropertyPathResolver.BuildChangeEvent(
-			ChangeEvent, static_cast<int32>(EPropertyChangeType::ValueSet)) || !ChangeEvent.IsValid())
-		{
-			OutErrorMessage = FString::Printf(
-				TEXT("Could not construct a property-change event for '%s' on AddOn %s"),
-				*ChangedPath, *AddOn->GetClass()->GetName());
-			return false;
-		}
-
-		if (!ActivatePropertyChangeChain(
-			AddOn, ChangedPath, PathSegments, const_cast<FProperty*>(PropertyPathResolver.Value.Property),
-			PropertyPathResolver.EventChain, ChangeEvent, OutErrorMessage))
-		{
-			return false;
-		}
-
-		// The change event borrows the resolver's chain, so dispatch it before the resolver leaves scope.
-		AddOn->PostEditChangeChainProperty(*ChangeEvent);
-		return true;
-	}
-
-	bool DispatchChangedPropertyPaths(
-		UFlowNodeAddOn* AddOn,
-		const TArray<FString>& ChangedPaths,
-		FString& OutErrorMessage)
-	{
-		// Stable order and exact de-duplication preserve distinct leaf callbacks under one root member.
-		TArray<FString> SortedUniquePaths = ChangedPaths;
-		SortedUniquePaths.Sort();
-		for (int32 PathIndex = SortedUniquePaths.Num() - 1; PathIndex > 0; --PathIndex)
-		{
-			if (SortedUniquePaths[PathIndex] == SortedUniquePaths[PathIndex - 1])
-			{
-				SortedUniquePaths.RemoveAt(PathIndex);
-			}
-		}
-
-		for (const FString& ChangedPath : SortedUniquePaths)
-		{
-			if (!DispatchChangedPropertyPath(AddOn, ChangedPath, OutErrorMessage))
-			{
-				return false;
-			}
-		}
-
-		return true;
-	}
-
-	bool DispatchAddOnTree(
-		UFlowNodeBase* Owner,
-		UFlowNode* OwningFlowNode,
-		const FFlowPendingAddOnPropertyChanges& PendingPropertyChanges,
-		TSet<UFlowNodeAddOn*>& VisitedAddOns,
-		FString& OutErrorMessage)
-	{
-		if (!IsValid(Owner))
-		{
-			return true;
-		}
-
-		// Refresh children before their parent so parent context queries observe final child pin caches.
-		for (UFlowNodeAddOn* AddOn : Owner->GetFlowNodeAddOnChildren())
-		{
-			if (!IsValid(AddOn) || VisitedAddOns.Contains(AddOn))
-			{
-				continue;
-			}
-
-			VisitedAddOns.Add(AddOn);
-			AddOn->SetFlowNodeForEditor(OwningFlowNode);
-			if (!DispatchAddOnTree(AddOn, OwningFlowNode, PendingPropertyChanges, VisitedAddOns, OutErrorMessage))
-			{
-				return false;
-			}
-
-			if (const TArray<FString>* ChangedPaths = PendingPropertyChanges.Find(AddOn))
-			{
-				if (!DispatchChangedPropertyPaths(AddOn, *ChangedPaths, OutErrorMessage))
-				{
-					return false;
-				}
-			}
-		}
-
-		return true;
-	}
-}
-
-bool UFlowGraphImporter::DispatchPendingAddOnPropertyChanges(
-	const TArray<UFlowNodeBase*>& RootOwners,
-	const FFlowPendingAddOnPropertyChanges& PendingPropertyChanges,
-	FString& OutErrorMessage)
-{
-	OutErrorMessage.Reset();
-
-	// Keep one scope per changed AddOn alive while callbacks dispatch across the completed trees.
-	// This suppresses intermediate editor rebuilds and restores bindings before the caller performs
-	// the final parent reconstruction.
-	TArray<TUniquePtr<FScopedFlowNodeReconstructionRequestDeferral>> ReconstructionDeferrals;
-	ReconstructionDeferrals.Reserve(PendingPropertyChanges.Num());
-	for (const TPair<UFlowNodeAddOn*, TArray<FString>>& Pair : PendingPropertyChanges)
-	{
-		if (IsValid(Pair.Key))
-		{
-			ReconstructionDeferrals.Add(MakeUnique<FScopedFlowNodeReconstructionRequestDeferral>(*Pair.Key));
-		}
-	}
-
-	// Traverse each root depth-first so child pin caches are current before parent callbacks run.
-	TSet<UFlowNodeAddOn*> VisitedAddOns;
-	for (UFlowNodeBase* RootOwner : RootOwners)
-	{
-		if (UFlowNode* FlowNode = Cast<UFlowNode>(RootOwner))
-		{
-			if (!FlowAddOnPropertyChangeDetail::DispatchAddOnTree(
-				RootOwner, FlowNode, PendingPropertyChanges, VisitedAddOns, OutErrorMessage))
-			{
-				return false;
-			}
-		}
-		else if (UFlowNodeAddOn* RootAddOn = Cast<UFlowNodeAddOn>(RootOwner))
-		{
-			if (!FlowAddOnPropertyChangeDetail::DispatchAddOnTree(
-				RootAddOn, RootAddOn->FindOwningFlowNode(), PendingPropertyChanges, VisitedAddOns, OutErrorMessage))
-			{
-				return false;
-			}
-		}
-	}
 	return true;
 }
 
@@ -1156,34 +580,565 @@ bool UFlowGraphImporter::WriteConnectionToNode(UFlowNode* NodeToModify, FName Ke
 	return true;
 }
 
-bool UFlowGraphImporter::SetAddOnProperties(
-	UFlowNodeAddOn* AddOn,
-	const TMap<FString, FString>& Properties,
+UClass* UFlowGraphImporter::ResolveNodeClassForQuery(const FString& NodeType)
+{
+	UClass* NodeClass = nullptr;
+
+	// Full path (contains /Script/ or a dot) - try direct load
+	if (NodeType.Contains(TEXT("/Script/")) || NodeType.Contains(TEXT(".")))
+	{
+		NodeClass = LoadObject<UClass>(nullptr, *NodeType);
+	}
+
+	// Short name - try /Script/Flow prefix
+	if (!NodeClass)
+	{
+		NodeClass = FindObject<UClass>(nullptr, *FString::Printf(TEXT("/Script/Flow.%s"), *NodeType));
+	}
+	if (!NodeClass)
+	{
+		NodeClass = LoadObject<UClass>(nullptr, *FString::Printf(TEXT("/Script/Flow.%s"), *NodeType));
+	}
+
+	// Last resort: as-is
+	if (!NodeClass)
+	{
+		NodeClass = FindObject<UClass>(nullptr, *NodeType);
+	}
+
+	return NodeClass;
+}
+
+bool UFlowGraphImporter::IsClassFromNonFlowBlueprint(const UClass* InClass, FString& OutReason)
+{
+	OutReason.Reset();
+
+	if (!InClass)
+	{
+		return false;
+	}
+
+#if WITH_EDITORONLY_DATA
+	// Native and AngelScript classes carry no generating Blueprint, so there is nothing to police.
+	// Fail open for them rather than guessing, so a missing ClassGeneratedBy can never block a
+	// legitimate compiled-in node type.
+	const UBlueprint* GeneratingBlueprint = Cast<UBlueprint>(InClass->ClassGeneratedBy);
+	if (!GeneratingBlueprint)
+	{
+		return false;
+	}
+
+	// UFlowNodeBlueprint and UFlowNodeAddOnBlueprint are siblings under UBlueprint, not a shared
+	// base, so both must be named explicitly - testing only the node form would reject every addon.
+	if (GeneratingBlueprint->IsA<UFlowNodeBlueprint>() || GeneratingBlueprint->IsA<UFlowNodeAddOnBlueprint>())
+	{
+		return false;
+	}
+
+	OutReason = FString::Printf(
+		TEXT("'%s' is generated by '%s', a plain %s rather than a FlowNodeBlueprint or ")
+		TEXT("FlowNodeAddOnBlueprint. It compiles, but the Flow palette and the FlowAgent catalog both ")
+		TEXT("gather by asset class, so neither can see it. Recreate it with the ")
+		TEXT("CreateFlowNodeBlueprint op."),
+		*InClass->GetPathName(),
+		*GeneratingBlueprint->GetPathName(),
+		*GeneratingBlueprint->GetClass()->GetName());
+	return true;
+#else
+	return false;
+#endif // WITH_EDITORONLY_DATA
+}
+
+UClass* UFlowGraphImporter::ResolveNodeClass(const FString& NodeType)
+{
+	UClass* NodeClass = ResolveNodeClassForQuery(NodeType);
+
+	FString RejectionReason;
+	if (IsClassFromNonFlowBlueprint(NodeClass, RejectionReason))
+	{
+		UE_LOG(LogFlow, Warning, TEXT("ResolveNodeClass rejected '%s': %s"), *NodeType, *RejectionReason);
+		return nullptr;
+	}
+
+	return NodeClass;
+}
+
+bool UFlowGraphImporter::CreateNodeAddOns(
+	const TMap<FGuid, UFlowNode*>& NodeMap,
+	const TArray<FFlowGraphParsedNode>& ParsedNodes,
+	FString& OutErrorMessage)
+{
+	// Preserve the convenience entry point while collecting every callback until all node trees exist.
+	FFlowPendingAddOnPropertyChanges PendingPropertyChanges;
+	if (!CreateNodeAddOns(NodeMap, ParsedNodes, PendingPropertyChanges, OutErrorMessage))
+	{
+		return false;
+	}
+
+	TArray<UFlowNodeBase*> RootOwners;
+	for (const TPair<FGuid, UFlowNode*>& NodePair : NodeMap)
+	{
+		RootOwners.Add(NodePair.Value);
+	}
+	// Dispatch from the roots so nested children run before their owning AddOns.
+	return DispatchPendingAddOnPropertyChanges(RootOwners, PendingPropertyChanges, OutErrorMessage);
+}
+
+bool UFlowGraphImporter::CreateNodeAddOns(
+	const TMap<FGuid, UFlowNode*>& NodeMap,
+	const TArray<FFlowGraphParsedNode>& ParsedNodes,
 	FFlowPendingAddOnPropertyChanges& OutPendingPropertyChanges,
 	FString& OutErrorMessage)
 {
-	// TMap iteration is unstable, so apply and queue changes in lexical path order.
-	TArray<TPair<FString, FString>> SortedProperties;
-	SortedProperties.Reserve(Properties.Num());
-	for (const TPair<FString, FString>& Pair : Properties)
+	// Reconcile each node's whole parsed subtree into the shared pending set.
+	for (const FFlowGraphParsedNode& ParsedNode : ParsedNodes)
 	{
-		SortedProperties.Add(Pair);
-	}
-	SortedProperties.Sort(&IsAddOnPropertyChangeBefore);
+		if (ParsedNode.AddOns.IsEmpty())
+		{
+			continue;
+		}
 
-	for (const TPair<FString, FString>& PropertyChange : SortedProperties)
-	{
-		if (!SetAddOnProperty(AddOn, PropertyChange, OutPendingPropertyChanges, OutErrorMessage))
+		UFlowNode* OwnerNode = NodeMap.FindRef(ParsedNode.NodeGuid);
+		if (!OwnerNode)
+		{
+			OutErrorMessage = FString::Printf(TEXT("CreateNodeAddOns: Could not find node for GUID %s"), *ParsedNode.NodeGuid.ToString());
+			return false;
+		}
+
+		if (!CreateAddOnsRecursive(OwnerNode, ParsedNode.AddOns, OutPendingPropertyChanges, OutErrorMessage))
 		{
 			return false;
 		}
 	}
 
+	return true;
+}
+
+bool UFlowGraphImporter::CreateAddOnsRecursive(
+	UFlowNodeBase* Owner,
+	const TArray<FFlowGraphParsedNodeAddOn>& ParsedAddOns,
+	FString& OutErrorMessage)
+{
+	FFlowPendingAddOnPropertyChanges PendingPropertyChanges;
+	if (!CreateAddOnsRecursive(Owner, ParsedAddOns, PendingPropertyChanges, OutErrorMessage))
+	{
+		return false;
+	}
+
+	TArray<UFlowNodeBase*> RootOwners;
+	RootOwners.Add(Owner);
+	return DispatchPendingAddOnPropertyChanges(RootOwners, PendingPropertyChanges, OutErrorMessage);
+}
+
+bool UFlowGraphImporter::CreateAddOnsRecursive(
+	UFlowNodeBase* Owner,
+	const TArray<FFlowGraphParsedNodeAddOn>& ParsedAddOns,
+	FFlowPendingAddOnPropertyChanges& OutPendingPropertyChanges,
+	FString& OutErrorMessage)
+{
+	if (ParsedAddOns.IsEmpty())
+	{
+		return true;
+	}
+
+	// Capture the owner before touching its reflected AddOns array so transaction undo includes attachment.
+	if (!Owner->HasAnyFlags(RF_Transient))
+	{
+		Owner->SetFlags(RF_Transactional);
+		Owner->Modify();
+	}
+
+	FArrayProperty* AddOnsProperty = FindFProperty<FArrayProperty>(UFlowNodeBase::StaticClass(), TEXT("AddOns"));
+	if (!AddOnsProperty)
+	{
+		OutErrorMessage = TEXT("CreateAddOnsRecursive: Could not find AddOns property on UFlowNodeBase");
+		return false;
+	}
+
+	FObjectProperty* ElemProp = CastField<FObjectProperty>(AddOnsProperty->Inner);
+	if (!ElemProp)
+	{
+		OutErrorMessage = TEXT("CreateAddOnsRecursive: AddOns array element property is not an object property");
+		return false;
+	}
+
+	for (const FFlowGraphParsedNodeAddOn& ParsedAddOn : ParsedAddOns)
+	{
+		if (ParsedAddOn.bIsDeleteMarker)
+		{
+			// Meaningless for a brand new owner - nothing to delete yet. Only relevant for
+			// FFlowGraphReconciler::ReconcileNodeAddOns on an already-existing owner.
+			continue;
+		}
+
+		UClass* AddOnClass = nullptr;
+
+		if (ParsedAddOn.AddOnType.Contains(TEXT("/Script/")) || ParsedAddOn.AddOnType.Contains(TEXT(".")))
+		{
+			AddOnClass = LoadObject<UClass>(nullptr, *ParsedAddOn.AddOnType);
+		}
+
+		if (!AddOnClass)
+		{
+			AddOnClass = FindObject<UClass>(nullptr, *FString::Printf(TEXT("/Script/Flow.%s"), *ParsedAddOn.AddOnType));
+		}
+
+		if (!AddOnClass || !AddOnClass->IsChildOf(UFlowNodeAddOn::StaticClass()))
+		{
+			OutErrorMessage = FString::Printf(TEXT("CreateAddOnsRecursive: Could not find AddOn class: %s"), *ParsedAddOn.AddOnType);
+			return false;
+		}
+
+		// NewObject on an abstract class trips an engine-level
+		// ensure() rather than returning null, which crashes the editor session mid-import.
+		if (AddOnClass->HasAnyClassFlags(CLASS_Abstract))
+		{
+			OutErrorMessage = FString::Printf(TEXT("CreateAddOnsRecursive: AddOn class is abstract and cannot be instantiated: %s"), *ParsedAddOn.AddOnType);
+			return false;
+		}
+
+		UFlowNodeAddOn* NewAddOn = NewObject<UFlowNodeAddOn>(Owner, AddOnClass, NAME_None, RF_Transactional);
+		if (!NewAddOn)
+		{
+			OutErrorMessage = FString::Printf(TEXT("CreateAddOnsRecursive: Failed to create AddOn of type: %s"), *ParsedAddOn.AddOnType);
+			return false;
+		}
+
+		NewAddOn->SetGuid(ParsedAddOn.AddOnGuid.IsValid() ? ParsedAddOn.AddOnGuid : FGuid::NewGuid());
+
+		// Apply authored fields now, but defer their callbacks until all siblings and children are attached.
+		if (!SetAddOnProperties(NewAddOn, ParsedAddOn.Properties, OutPendingPropertyChanges, OutErrorMessage))
+		{
+			return false;
+		}
+
+		// Attach before descending so callbacks can later query the complete owner and sibling set.
+		// Re-acquire the helper each iteration because an earlier append may have reallocated the array.
+		void* AddOnsPtr = AddOnsProperty->ContainerPtrToValuePtr<void>(Owner);
+		FScriptArrayHelper AddOnsHelper(AddOnsProperty, AddOnsPtr);
+		const int32 NewIndex = AddOnsHelper.AddValue();
+		ElemProp->SetObjectPropertyValue(AddOnsHelper.GetRawPtr(NewIndex), NewAddOn);
+
+		if (!CreateAddOnsRecursive(NewAddOn, ParsedAddOn.AddOns, OutPendingPropertyChanges, OutErrorMessage))
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
 #if WITH_EDITORONLY_DATA
-	// Keep data-pin directions consistent with the AddOn class defaults after reflected writes.
-	SyncAddOnDataPinValueDirections(AddOn);
+void UFlowGraphImporter::SyncAddOnDataPinValueDirections(UFlowNodeAddOn* AddOn)
+{
+	if (!AddOn)
+	{
+		return;
+	}
+
+	const UFlowNodeAddOn* CDO = Cast<UFlowNodeAddOn>(AddOn->GetClass()->GetDefaultObject());
+	if (!CDO)
+	{
+		return;
+	}
+
+	static const UScriptStruct* NamedDataPinPropertyStruct = FFlowNamedDataPinProperty::StaticStruct();
+
+	for (TFieldIterator<FStructProperty> PropIt(AddOn->GetClass()); PropIt; ++PropIt)
+	{
+		FStructProperty* StructProp = *PropIt;
+		if (!StructProp || !StructProp->Struct->IsChildOf(NamedDataPinPropertyStruct))
+		{
+			continue;
+		}
+
+		FFlowNamedDataPinProperty* InstanceProp = StructProp->ContainerPtrToValuePtr<FFlowNamedDataPinProperty>(AddOn);
+		const FFlowNamedDataPinProperty* CDOProp = StructProp->ContainerPtrToValuePtr<FFlowNamedDataPinProperty>(CDO);
+
+		if (!InstanceProp || !CDOProp)
+		{
+			continue;
+		}
+
+		FFlowDataPinValue* InstanceValue = InstanceProp->DataPinValue.GetMutablePtr<FFlowDataPinValue>();
+		const FFlowDataPinValue* CDOValue = CDOProp->DataPinValue.GetPtr<FFlowDataPinValue>();
+
+		if (InstanceValue && CDOValue)
+		{
+			InstanceValue->bIsInputPin = CDOValue->bIsInputPin;
+		}
+	}
+}
 #endif
 
+namespace FlowAddOnPropertyChangeDetail
+{
+	// Find the struct to inspect after a property segment, including the element type of struct arrays.
+	const UStruct* FindNestedStruct(const FProperty* Property)
+	{
+		if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property))
+		{
+			return StructProperty->Struct;
+		}
+
+		if (const FArrayProperty* ArrayProperty = CastField<FArrayProperty>(Property))
+		{
+			if (const FStructProperty* InnerStructProperty = CastField<FStructProperty>(ArrayProperty->Inner))
+			{
+				return InnerStructProperty->Struct;
+			}
+		}
+
+		return nullptr;
+	}
+
+	bool BuildTypedPropertyPath(
+		UFlowNodeAddOn* AddOn,
+		const FString& ChangedPath,
+		TArray<FString>& OutPathSegments,
+		UE::FPropertyPathName& OutPropertyPath,
+		FString& OutErrorMessage)
+	{
+		// Resolve FlowAgent names to typed reflected segments so CoreUObject can construct the
+		// callback event used to refresh AddOn pin caches during preview and commit.
+		ChangedPath.ParseIntoArray(OutPathSegments, TEXT("."), true);
+		if (OutPathSegments.IsEmpty())
+		{
+			OutErrorMessage = FString::Printf(TEXT("Property path '%s' is empty"), *ChangedPath);
+			return false;
+		}
+
+		const UStruct* CurrentStruct = AddOn->GetClass();
+		FProperty* PreviousProperty = nullptr;
+		bool bPreviousPropertyNeedsArrayIndex = false;
+		for (const FString& PathSegment : OutPathSegments)
+		{
+			if (PathSegment.IsNumeric())
+			{
+				if (!PreviousProperty || !bPreviousPropertyNeedsArrayIndex)
+				{
+					OutErrorMessage = FString::Printf(
+						TEXT("Unexpected array index '%s' in property path '%s'"), *PathSegment, *ChangedPath);
+					return false;
+				}
+
+				OutPropertyPath.SetIndex(FCString::Atoi(*PathSegment));
+				CurrentStruct = FindNestedStruct(PreviousProperty);
+				bPreviousPropertyNeedsArrayIndex = false;
+				continue;
+			}
+
+			if (!CurrentStruct || bPreviousPropertyNeedsArrayIndex)
+			{
+				OutErrorMessage = FString::Printf(
+					TEXT("Cannot resolve property '%s' in path '%s'"), *PathSegment, *ChangedPath);
+				return false;
+			}
+
+			FProperty* Property = FindFProperty<FProperty>(CurrentStruct, *PathSegment);
+			if (!Property)
+			{
+				OutErrorMessage = FString::Printf(
+					TEXT("Could not find property '%s' in path '%s'"), *PathSegment, *ChangedPath);
+				return false;
+			}
+
+			UE::FPropertyPathNameSegment PropertySegment;
+			PropertySegment.Name = Property->GetFName();
+			PropertySegment.Type = UE::FPropertyTypeName(Property);
+			OutPropertyPath.Push(PropertySegment);
+
+			PreviousProperty = Property;
+			CurrentStruct = FindNestedStruct(Property);
+			bPreviousPropertyNeedsArrayIndex =
+				CastField<FArrayProperty>(Property) != nullptr || Property->ArrayDim > 1;
+		}
+
+		return true;
+	}
+
+	bool ActivatePropertyChangeChain(
+		UFlowNodeAddOn* AddOn,
+		const FString& ChangedPath,
+		const TArray<FString>& PathSegments,
+		FProperty* ActiveProperty,
+		FEditPropertyChain& PropertyChain,
+		TSharedPtr<FPropertyChangedChainEvent>& OutChangeEvent,
+		FString& OutErrorMessage)
+	{
+		// Mark the leaf and root member active so callbacks see the same edit context as Details edits.
+		FProperty* ActiveMemberProperty = FindFProperty<FProperty>(AddOn->GetClass(), *PathSegments[0]);
+		if (!ActiveMemberProperty || !PropertyChain.SetActivePropertyNode(ActiveProperty) ||
+			!PropertyChain.SetActiveMemberPropertyNode(ActiveMemberProperty))
+		{
+			OutErrorMessage = FString::Printf(
+				TEXT("Could not activate the property-change chain for '%s' on AddOn %s"),
+				*ChangedPath, *AddOn->GetClass()->GetName());
+			return false;
+		}
+
+		OutChangeEvent->SetActiveMemberProperty(ActiveMemberProperty);
+		return true;
+	}
+
+	bool DispatchChangedPropertyPath(
+		UFlowNodeAddOn* AddOn,
+		const FString& ChangedPath,
+		FString& OutErrorMessage)
+	{
+		TArray<FString> PathSegments;
+		UE::FPropertyPathName PropertyPath;
+		if (!BuildTypedPropertyPath(AddOn, ChangedPath, PathSegments, PropertyPath, OutErrorMessage))
+		{
+			return false;
+		}
+
+#if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 8, 0)
+		UE::FPropertyPathNameResolver PropertyPathResolver(PropertyPath, AddOn);
+		FEditPropertyChain& ResolvedPropertyChain = PropertyPathResolver.EventChain;
+		TSharedPtr<FPropertyChangedChainEvent> ChangeEvent;
+		FProperty* ActiveProperty = const_cast<FProperty*>(PropertyPathResolver.Value.Property);
+		if (!PropertyPathResolver.BuildChangeEvent(
+			ChangeEvent, static_cast<int32>(EPropertyChangeType::ValueSet)) || !ChangeEvent.IsValid())
+#else
+		FEditPropertyChain PropertyChain;
+		TSharedPtr<FPropertyChangedChainEvent> ChangeEvent;
+		FEditPropertyChain& ResolvedPropertyChain = PropertyChain;
+		const UE::FPropertyValueInContainer PropertyValue = UE::TryResolvePropertyPathForChangeEvent(
+			PropertyPath,
+			AddOn,
+			static_cast<uint32>(EPropertyChangeType::ValueSet),
+			ChangeEvent,
+			PropertyChain);
+		FProperty* ActiveProperty = const_cast<FProperty*>(PropertyValue.Property);
+		if (!PropertyValue || !ChangeEvent.IsValid())
+#endif
+		{
+			OutErrorMessage = FString::Printf(
+				TEXT("Could not construct a property-change event for '%s' on AddOn %s"),
+				*ChangedPath, *AddOn->GetClass()->GetName());
+			return false;
+		}
+
+		if (!ActivatePropertyChangeChain(
+			AddOn, ChangedPath, PathSegments, ActiveProperty, ResolvedPropertyChain, ChangeEvent, OutErrorMessage))
+		{
+			return false;
+		}
+
+		// The change event borrows its property chain, so dispatch it before the chain leaves scope.
+		AddOn->PostEditChangeChainProperty(*ChangeEvent);
+		return true;
+	}
+
+	bool DispatchChangedPropertyPaths(
+		UFlowNodeAddOn* AddOn,
+		const TArray<FString>& ChangedPaths,
+		FString& OutErrorMessage)
+	{
+		// Stable order and exact de-duplication preserve distinct leaf callbacks under one root member.
+		TArray<FString> SortedUniquePaths = ChangedPaths;
+		SortedUniquePaths.Sort();
+		for (int32 PathIndex = SortedUniquePaths.Num() - 1; PathIndex > 0; --PathIndex)
+		{
+			if (SortedUniquePaths[PathIndex] == SortedUniquePaths[PathIndex - 1])
+			{
+				SortedUniquePaths.RemoveAt(PathIndex);
+			}
+		}
+
+		for (const FString& ChangedPath : SortedUniquePaths)
+		{
+			if (!DispatchChangedPropertyPath(AddOn, ChangedPath, OutErrorMessage))
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	bool DispatchAddOnTree(
+		UFlowNodeBase* Owner,
+		UFlowNode* OwningFlowNode,
+		const FFlowPendingAddOnPropertyChanges& PendingPropertyChanges,
+		TSet<UFlowNodeAddOn*>& VisitedAddOns,
+		FString& OutErrorMessage)
+	{
+		if (!IsValid(Owner))
+		{
+			return true;
+		}
+
+		// Refresh children before their parent so parent context queries observe final child pin caches.
+		for (UFlowNodeAddOn* AddOn : Owner->GetFlowNodeAddOnChildren())
+		{
+			if (!IsValid(AddOn) || VisitedAddOns.Contains(AddOn))
+			{
+				continue;
+			}
+
+			VisitedAddOns.Add(AddOn);
+			AddOn->SetFlowNodeForEditor(OwningFlowNode);
+			if (!DispatchAddOnTree(AddOn, OwningFlowNode, PendingPropertyChanges, VisitedAddOns, OutErrorMessage))
+			{
+				return false;
+			}
+
+			if (const TArray<FString>* ChangedPaths = PendingPropertyChanges.Find(AddOn))
+			{
+				if (!DispatchChangedPropertyPaths(AddOn, *ChangedPaths, OutErrorMessage))
+				{
+					return false;
+				}
+			}
+		}
+
+		return true;
+	}
+}
+
+bool UFlowGraphImporter::DispatchPendingAddOnPropertyChanges(
+	const TArray<UFlowNodeBase*>& RootOwners,
+	const FFlowPendingAddOnPropertyChanges& PendingPropertyChanges,
+	FString& OutErrorMessage)
+{
+	OutErrorMessage.Reset();
+
+	// Keep one scope per changed AddOn alive while callbacks dispatch across the completed trees.
+	// This suppresses intermediate editor rebuilds and restores bindings before the caller performs
+	// the final parent reconstruction.
+	TArray<TUniquePtr<FScopedFlowNodeReconstructionRequestDeferral>> ReconstructionDeferrals;
+	ReconstructionDeferrals.Reserve(PendingPropertyChanges.Num());
+	for (const TPair<UFlowNodeAddOn*, TArray<FString>>& Pair : PendingPropertyChanges)
+	{
+		if (IsValid(Pair.Key))
+		{
+			ReconstructionDeferrals.Add(MakeUnique<FScopedFlowNodeReconstructionRequestDeferral>(*Pair.Key));
+		}
+	}
+
+	// Traverse each root depth-first so child pin caches are current before parent callbacks run.
+	TSet<UFlowNodeAddOn*> VisitedAddOns;
+	for (UFlowNodeBase* RootOwner : RootOwners)
+	{
+		if (UFlowNode* FlowNode = Cast<UFlowNode>(RootOwner))
+		{
+			if (!FlowAddOnPropertyChangeDetail::DispatchAddOnTree(
+				RootOwner, FlowNode, PendingPropertyChanges, VisitedAddOns, OutErrorMessage))
+			{
+				return false;
+			}
+		}
+		else if (UFlowNodeAddOn* RootAddOn = Cast<UFlowNodeAddOn>(RootOwner))
+		{
+			if (!FlowAddOnPropertyChangeDetail::DispatchAddOnTree(
+				RootAddOn, RootAddOn->FindOwningFlowNode(), PendingPropertyChanges, VisitedAddOns, OutErrorMessage))
+			{
+				return false;
+			}
+		}
+	}
 	return true;
 }
 
@@ -1271,48 +1226,150 @@ bool UFlowGraphImporter::SetAddOnProperty(
 	return true;
 }
 
-#if WITH_EDITORONLY_DATA
-void UFlowGraphImporter::SyncAddOnDataPinValueDirections(UFlowNodeAddOn* AddOn)
+namespace
 {
-	if (!AddOn)
+	// Stabilize reflected writes so repeated imports dispatch property callbacks in a predictable order.
+	bool IsAddOnPropertyChangeBefore(
+		const TPair<FString, FString>& Left,
+		const TPair<FString, FString>& Right)
 	{
-		return;
-	}
-
-	const UFlowNodeAddOn* CDO = Cast<UFlowNodeAddOn>(AddOn->GetClass()->GetDefaultObject());
-	if (!CDO)
-	{
-		return;
-	}
-
-	static const UScriptStruct* NamedDataPinPropertyStruct = FFlowNamedDataPinProperty::StaticStruct();
-
-	for (TFieldIterator<FStructProperty> PropIt(AddOn->GetClass()); PropIt; ++PropIt)
-	{
-		FStructProperty* StructProp = *PropIt;
-		if (!StructProp || !StructProp->Struct->IsChildOf(NamedDataPinPropertyStruct))
-		{
-			continue;
-		}
-
-		FFlowNamedDataPinProperty* InstanceProp = StructProp->ContainerPtrToValuePtr<FFlowNamedDataPinProperty>(AddOn);
-		const FFlowNamedDataPinProperty* CDOProp = StructProp->ContainerPtrToValuePtr<FFlowNamedDataPinProperty>(CDO);
-
-		if (!InstanceProp || !CDOProp)
-		{
-			continue;
-		}
-
-		FFlowDataPinValue* InstanceValue = InstanceProp->DataPinValue.GetMutablePtr<FFlowDataPinValue>();
-		const FFlowDataPinValue* CDOValue = CDOProp->DataPinValue.GetPtr<FFlowDataPinValue>();
-
-		if (InstanceValue && CDOValue)
-		{
-			InstanceValue->bIsInputPin = CDOValue->bIsInputPin;
-		}
+		return Left.Key < Right.Key;
 	}
 }
+
+bool UFlowGraphImporter::SetAddOnProperties(
+	UFlowNodeAddOn* AddOn,
+	const TMap<FString, FString>& Properties,
+	FFlowPendingAddOnPropertyChanges& OutPendingPropertyChanges,
+	FString& OutErrorMessage)
+{
+	// TMap iteration is unstable, so apply and queue changes in lexical path order.
+	TArray<TPair<FString, FString>> SortedProperties;
+	SortedProperties.Reserve(Properties.Num());
+	for (const TPair<FString, FString>& Pair : Properties)
+	{
+		SortedProperties.Add(Pair);
+	}
+	SortedProperties.Sort(&IsAddOnPropertyChangeBefore);
+
+	for (const TPair<FString, FString>& PropertyChange : SortedProperties)
+	{
+		if (!SetAddOnProperty(AddOn, PropertyChange, OutPendingPropertyChanges, OutErrorMessage))
+		{
+			return false;
+		}
+	}
+
+#if WITH_EDITORONLY_DATA
+	// Keep data-pin directions consistent with the AddOn class defaults after reflected writes.
+	SyncAddOnDataPinValueDirections(AddOn);
 #endif
+
+	return true;
+}
+
+bool UFlowGraphImporter::ResolvePropertyPath(UStruct* OwnerStruct, void* ContainerPtr, const FString& PropertyPath, FProperty*& OutProperty, void*& OutValuePtr, FString& OutErrorMessage)
+{
+	TArray<FString> Segments;
+	PropertyPath.ParseIntoArray(Segments, TEXT("."), true);
+	if (Segments.IsEmpty())
+	{
+		OutErrorMessage = FString::Printf(TEXT("Empty property path '%s'"), *PropertyPath);
+		return false;
+	}
+
+	UStruct* CurrentOwnerStruct = OwnerStruct;
+	void* CurrentContainerPtr = ContainerPtr;
+
+	// Set when the previous segment resolved to an FArrayProperty - the next segment must be a
+	// numeric index into it rather than a property name on CurrentOwnerStruct.
+	FArrayProperty* PendingArrayProperty = nullptr;
+	void* PendingArrayContainerPtr = nullptr;
+
+	FProperty* ResolvedProperty = nullptr;
+	void* ResolvedValuePtr = nullptr;
+
+	for (int32 SegmentIndex = 0; SegmentIndex < Segments.Num(); ++SegmentIndex)
+	{
+		const FString& Segment = Segments[SegmentIndex];
+		const bool bIsLastSegment = (SegmentIndex == Segments.Num() - 1);
+
+		if (PendingArrayProperty)
+		{
+			if (!Segment.IsNumeric())
+			{
+				OutErrorMessage = FString::Printf(TEXT("Expected an array index after '%s' in path '%s', got '%s'"),
+					*PendingArrayProperty->GetName(), *PropertyPath, *Segment);
+				return false;
+			}
+
+			FScriptArrayHelper ArrayHelper(PendingArrayProperty, PendingArrayContainerPtr);
+			const int32 ArrayIndex = FCString::Atoi(*Segment);
+			if (!ArrayHelper.IsValidIndex(ArrayIndex))
+			{
+				OutErrorMessage = FString::Printf(TEXT("Array index %d out of bounds (size %d) for '%s' in path '%s'"),
+					ArrayIndex, ArrayHelper.Num(), *PendingArrayProperty->GetName(), *PropertyPath);
+				return false;
+			}
+
+			ResolvedProperty = PendingArrayProperty->Inner;
+			ResolvedValuePtr = ArrayHelper.GetRawPtr(ArrayIndex);
+			PendingArrayProperty = nullptr;
+		}
+		else
+		{
+			if (!CurrentOwnerStruct)
+			{
+				OutErrorMessage = FString::Printf(TEXT("Cannot resolve '%s' in path '%s' - preceding segment is not a struct"),
+					*Segment, *PropertyPath);
+				return false;
+			}
+
+			FProperty* Property = CurrentOwnerStruct->FindPropertyByName(*Segment);
+			if (!Property)
+			{
+				Property = FindFProperty<FProperty>(CurrentOwnerStruct, *Segment);
+			}
+
+			if (!Property)
+			{
+				OutErrorMessage = FString::Printf(TEXT("Could not find property '%s' (in path '%s') on %s"),
+					*Segment, *PropertyPath, *CurrentOwnerStruct->GetName());
+				return false;
+			}
+
+			ResolvedProperty = Property;
+			ResolvedValuePtr = Property->ContainerPtrToValuePtr<void>(CurrentContainerPtr);
+		}
+
+		if (bIsLastSegment)
+		{
+			break;
+		}
+
+		if (FStructProperty* StructProperty = CastField<FStructProperty>(ResolvedProperty))
+		{
+			CurrentOwnerStruct = StructProperty->Struct;
+			CurrentContainerPtr = ResolvedValuePtr;
+		}
+		else if (FArrayProperty* ArrayProperty = CastField<FArrayProperty>(ResolvedProperty))
+		{
+			PendingArrayProperty = ArrayProperty;
+			PendingArrayContainerPtr = ResolvedValuePtr;
+			CurrentOwnerStruct = nullptr;
+		}
+		else
+		{
+			OutErrorMessage = FString::Printf(TEXT("Cannot descend into '%s' (in path '%s') - property is a %s, which is neither a struct nor an array"),
+				*Segment, *PropertyPath, *ResolvedProperty->GetClass()->GetName());
+			return false;
+		}
+	}
+
+	OutProperty = ResolvedProperty;
+	OutValuePtr = ResolvedValuePtr;
+	return true;
+}
 
 // Splits "/Script/Foo.Bar(A=1,B=(C=2))" into its class path and its field block, so an instanced
 // object property can be authored as a class plus inline field values. Returns false for a plain
@@ -1625,107 +1682,66 @@ bool UFlowGraphImporter::SetPropertyFromString(FProperty* Property, void* ValueP
 	return false;
 }
 
-bool UFlowGraphImporter::ResolvePropertyPath(UStruct* OwnerStruct, void* ContainerPtr, const FString& PropertyPath, FProperty*& OutProperty, void*& OutValuePtr, FString& OutErrorMessage)
+static FName ParsePinNameToken(const FString& RawToken)
 {
-	TArray<FString> Segments;
-	PropertyPath.ParseIntoArray(Segments, TEXT("."), true);
-	if (Segments.IsEmpty())
+	// A pin name is normally free text with incidental whitespace trimmed - but exactly one class
+	// declares an intentionally-blank pin name (a single-space-named exec pin, seen in some
+	// project-specific nodes), and trimming that down to an empty string collapses it to NAME_None, which
+	// then fails to resolve against the real pin. If trimming would erase an otherwise non-empty
+	// token, the token *was* meaningful whitespace - fall back to a single space rather than losing
+	// it, matching that class's own sentinel value.
+	const FString Trimmed = RawToken.TrimStartAndEnd();
+	if (Trimmed.IsEmpty() && !RawToken.IsEmpty())
 	{
-		OutErrorMessage = FString::Printf(TEXT("Empty property path '%s'"), *PropertyPath);
+		return FName(TEXT(" "));
+	}
+	return FName(*Trimmed);
+}
+
+bool UFlowGraphImporter::ParsePinDecl(const FString& PinDecl, FName& OutPinName, FString& OutPinType, FString& OutSubCategoryPath)
+{
+	// Trim only the trailing edge here, for the same reason ParseNodes's pin-line extraction does -
+	// the leading edge can legitimately be (part of) an intentionally-blank pin's name, and a full
+	// trim would erase it before the " [" name/type boundary below is ever located.
+	FString Trimmed = PinDecl;
+	Trimmed.TrimEndInline();
+	if (Trimmed.IsEmpty())
+	{
 		return false;
 	}
 
-	UStruct* CurrentOwnerStruct = OwnerStruct;
-	void* CurrentContainerPtr = ContainerPtr;
-
-	// Set when the previous segment resolved to an FArrayProperty - the next segment must be a
-	// numeric index into it rather than a property name on CurrentOwnerStruct.
-	FArrayProperty* PendingArrayProperty = nullptr;
-	void* PendingArrayContainerPtr = nullptr;
-
-	FProperty* ResolvedProperty = nullptr;
-	void* ResolvedValuePtr = nullptr;
-
-	for (int32 SegmentIndex = 0; SegmentIndex < Segments.Num(); ++SegmentIndex)
+	FString PinName;
+	FString BracketContent;
+	if (Trimmed.Split(TEXT(" ["), &PinName, &BracketContent))
 	{
-		const FString& Segment = Segments[SegmentIndex];
-		const bool bIsLastSegment = (SegmentIndex == Segments.Num() - 1);
+		BracketContent.RemoveFromEnd(TEXT("]"));
+		BracketContent = BracketContent.TrimStartAndEnd();
 
-		if (PendingArrayProperty)
+		// Sub-category form: "PinType:/Object/Path" - split on first ':'
+		FString TypePart;
+		FString SubCatPart;
+		if (BracketContent.Split(TEXT(":"), &TypePart, &SubCatPart))
 		{
-			if (!Segment.IsNumeric())
-			{
-				OutErrorMessage = FString::Printf(TEXT("Expected an array index after '%s' in path '%s', got '%s'"),
-					*PendingArrayProperty->GetName(), *PropertyPath, *Segment);
-				return false;
-			}
-
-			FScriptArrayHelper ArrayHelper(PendingArrayProperty, PendingArrayContainerPtr);
-			const int32 ArrayIndex = FCString::Atoi(*Segment);
-			if (!ArrayHelper.IsValidIndex(ArrayIndex))
-			{
-				OutErrorMessage = FString::Printf(TEXT("Array index %d out of bounds (size %d) for '%s' in path '%s'"),
-					ArrayIndex, ArrayHelper.Num(), *PendingArrayProperty->GetName(), *PropertyPath);
-				return false;
-			}
-
-			ResolvedProperty = PendingArrayProperty->Inner;
-			ResolvedValuePtr = ArrayHelper.GetRawPtr(ArrayIndex);
-			PendingArrayProperty = nullptr;
+			OutPinType          = TypePart.TrimStartAndEnd();
+			OutSubCategoryPath  = SubCatPart.TrimStartAndEnd();
 		}
 		else
 		{
-			if (!CurrentOwnerStruct)
-			{
-				OutErrorMessage = FString::Printf(TEXT("Cannot resolve '%s' in path '%s' - preceding segment is not a struct"),
-					*Segment, *PropertyPath);
-				return false;
-			}
-
-			FProperty* Property = CurrentOwnerStruct->FindPropertyByName(*Segment);
-			if (!Property)
-			{
-				Property = FindFProperty<FProperty>(CurrentOwnerStruct, *Segment);
-			}
-
-			if (!Property)
-			{
-				OutErrorMessage = FString::Printf(TEXT("Could not find property '%s' (in path '%s') on %s"),
-					*Segment, *PropertyPath, *CurrentOwnerStruct->GetName());
-				return false;
-			}
-
-			ResolvedProperty = Property;
-			ResolvedValuePtr = Property->ContainerPtrToValuePtr<void>(CurrentContainerPtr);
+			OutPinType         = BracketContent;
+			OutSubCategoryPath = FString();
 		}
-
-		if (bIsLastSegment)
-		{
-			break;
-		}
-
-		if (FStructProperty* StructProperty = CastField<FStructProperty>(ResolvedProperty))
-		{
-			CurrentOwnerStruct = StructProperty->Struct;
-			CurrentContainerPtr = ResolvedValuePtr;
-		}
-		else if (FArrayProperty* ArrayProperty = CastField<FArrayProperty>(ResolvedProperty))
-		{
-			PendingArrayProperty = ArrayProperty;
-			PendingArrayContainerPtr = ResolvedValuePtr;
-			CurrentOwnerStruct = nullptr;
-		}
-		else
-		{
-			OutErrorMessage = FString::Printf(TEXT("Cannot descend into '%s' (in path '%s') - property is a %s, which is neither a struct nor an array"),
-				*Segment, *PropertyPath, *ResolvedProperty->GetClass()->GetName());
-			return false;
-		}
+		OutPinName = ParsePinNameToken(PinName);
+	}
+	else
+	{
+		// No " [Type]" suffix at all (bare name) - this shape never carries the blank-pin ambiguity
+		// (the real format always includes a type annotation), so a normal full trim is correct here.
+		OutPinName         = FName(*Trimmed.TrimStartAndEnd());
+		OutPinType         = FString();
+		OutSubCategoryPath = FString();
 	}
 
-	OutProperty = ResolvedProperty;
-	OutValuePtr = ResolvedValuePtr;
-	return true;
+	return !OutPinName.IsNone();
 }
 
 void UFlowGraphImporter::ApplyDeclaredPins(UFlowNode* NewNode, const FFlowGraphParsedNode& ParsedNode)
