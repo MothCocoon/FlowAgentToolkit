@@ -20,6 +20,7 @@
 #include "UObject/PropertyPathName.h"
 #include "Templates/Function.h"
 #include "Templates/UniquePtr.h"
+#include "Misc/EngineVersionComparison.h"
 #include "Misc/PackageName.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Graph/FlowGraph.h"
@@ -829,10 +830,26 @@ namespace FlowAddOnPropertyChangeDetail
 			return false;
 		}
 
+#if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 8, 0)
 		UE::FPropertyPathNameResolver PropertyPathResolver(PropertyPath, AddOn);
+		FEditPropertyChain& ResolvedPropertyChain = PropertyPathResolver.EventChain;
 		TSharedPtr<FPropertyChangedChainEvent> ChangeEvent;
+		FProperty* ActiveProperty = const_cast<FProperty*>(PropertyPathResolver.Value.Property);
 		if (!PropertyPathResolver.BuildChangeEvent(
 			ChangeEvent, static_cast<int32>(EPropertyChangeType::ValueSet)) || !ChangeEvent.IsValid())
+#else
+		FEditPropertyChain PropertyChain;
+		TSharedPtr<FPropertyChangedChainEvent> ChangeEvent;
+		FEditPropertyChain& ResolvedPropertyChain = PropertyChain;
+		const UE::FPropertyValueInContainer PropertyValue = UE::TryResolvePropertyPathForChangeEvent(
+			PropertyPath,
+			AddOn,
+			static_cast<uint32>(EPropertyChangeType::ValueSet),
+			ChangeEvent,
+			PropertyChain);
+		FProperty* ActiveProperty = const_cast<FProperty*>(PropertyValue.Property);
+		if (!PropertyValue || !ChangeEvent.IsValid())
+#endif
 		{
 			OutErrorMessage = FString::Printf(
 				TEXT("Could not construct a property-change event for '%s' on AddOn %s"),
@@ -841,13 +858,12 @@ namespace FlowAddOnPropertyChangeDetail
 		}
 
 		if (!ActivatePropertyChangeChain(
-			AddOn, ChangedPath, PathSegments, const_cast<FProperty*>(PropertyPathResolver.Value.Property),
-			PropertyPathResolver.EventChain, ChangeEvent, OutErrorMessage))
+			AddOn, ChangedPath, PathSegments, ActiveProperty, ResolvedPropertyChain, ChangeEvent, OutErrorMessage))
 		{
 			return false;
 		}
 
-		// The change event borrows the resolver's chain, so dispatch it before the resolver leaves scope.
+		// The change event borrows its property chain, so dispatch it before the chain leaves scope.
 		AddOn->PostEditChangeChainProperty(*ChangeEvent);
 		return true;
 	}
