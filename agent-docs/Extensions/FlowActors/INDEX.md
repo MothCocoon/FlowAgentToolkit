@@ -23,6 +23,11 @@ Call `FindFlowNodeTypes` with the target asset class and a query for the desired
 Use the returned class descriptions and reflected shape to select a node or addon, then follow the
 generic Flow authoring workflow.
 
+## Concepts
+
+- $KB:flow:concept:spawn-and-fight-actors - when to use the one-shot Spawn Actors node or the
+  tracked Fight Actors node, and how selectors, spawn records, cohorts, and reinforcement fit together.
+
 ## See also
 
 - $KB:flow:guide:official-plugins-index
