@@ -23,7 +23,7 @@ Call `FindFlowNodeTypes` with the target asset class and a query for the desired
 Use the returned class descriptions and reflected shape to select a node or addon, then follow the
 generic Flow authoring workflow.
 
-Some key extensions to FlowActors can be found in AIFlowActors plugin (also official), which adds 
+Some key extensions to FlowActors can be found in AIFlowActors plugin (also official), which adds
 AIModule-specific support for EQS and blackboard to FlowActors classes.
 
 ## Concepts
