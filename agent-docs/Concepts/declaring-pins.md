@@ -126,10 +126,10 @@ force-load referenced assets.
 - Pins whose *set* depends on config/subobjects -> **context pins** (§6).
 - Designer-authored pins on the instance -> **`FFlowNamedDataPinProperty`** (§5).
 
-## Project-layer note
+## Extension-layer note
 
-An extension plugin or consuming project may add dynamic pin sources beyond those described here.
-Read its own authoring guide for those declarations and generation hooks.
+An official extension may add dynamic pin sources beyond those described here. Read its plugin
+section in the official index for related authoring guides and generation hooks.
 
 ## See also
 

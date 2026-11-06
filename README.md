@@ -8,3 +8,6 @@ plugin redirects reflected references from the previous module name.
 
 See the [MCP integration guide](docs/MCPIntegration.md), the [FlowAgent format guide](agent-docs/FlowAgentFormat.md),
 and the [Flow agent skill](.agents/skills/flow/SKILL.md).
+
+For agent guidance covering all seven official Flow plugins, start at the
+[official plugins index](agent-docs/OfficialPluginsIndex.md).

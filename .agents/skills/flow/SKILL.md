@@ -1,14 +1,15 @@
 ---
 name: flow
 description: >
-  Flow graph authoring and Courier JSON editing for any FlowAsset. Use for Flow nodes, addons,
-  graph structure, and Courier tools. Load a project's Flow skill first for its own asset subclass.
+  Flow graph authoring and FlowAgent v2 JSON editing for any FlowAsset. Use for Flow nodes, addons,
+  graph structure, and FlowAgent tools. When an official extension provides a companion skill for
+  its specialized FlowAsset subclass, load that skill first.
 ---
 
 # Flow
 
 Authoring, editing and explaining Flow graph content, for any `UFlowAsset` subclass. This is the
-core layer: it describes mechanics that hold for every project, and names no project-specific
+core layer: it describes mechanics shared by official Flow plugins, and names no extension-specific
 class or content prefix.
 
 ## The model
@@ -39,7 +40,7 @@ designer reading the graph, but nothing executes differently because of them.
 
 ## Reading and writing graphs
 
-Graphs serialize as **Courier v2**: one JSON document type that serves both a complete dump and a
+Graphs serialize as **FlowAgent v2**: one JSON document type that serves both a complete dump and a
 narrow patch, differing only in how many ops it carries. A document has a `mode`, a few
 asset-level header fields, and a list of `ops` - `UpsertNode`, `DeleteNode`, `UpsertAddon`,
 `DeleteAddon`, `AddConnection`, `RemoveConnection`. Identity is explicit: an op names an existing
@@ -63,16 +64,15 @@ when to extract sprawling or repeated sections, how to design a narrow function-
 interface, and the lifecycle limits of `CustomInput`. Read `references/flow-ops.md` when you already
 know which op you want and need its parameters, returns and traps. For what a document's fields
 mean, and the export-text rules that govern property values, fetch
-`$KB:flow:guide:courier-text-format`. Read `CONTRIBUTING.md` before adding a reference file.
+`$KB:flow:guide:flowagent-format`. Read `CONTRIBUTING.md` before adding a reference file.
 
 ## The knowledge base
 
-Flow's agent-facing knowledge base is markdown, federated across `agent-docs/` roots:
+Flow's official plugin agent docs and skills are centralized in FlowAgentToolkit:
 
-- This plugin's `agent-docs/` - generic concepts and authoring guides.
-- An extension plugin's `agent-docs/`, when that plugin is installed.
-- A project's own `agent-docs/` root, for its asset subclasses and its design-decision log. A
-  companion domain skill names that path; this file deliberately does not.
+- This `agent-docs/` root covers generic Flow concepts and authoring guides.
+- `Extensions/<Plugin>/` contains agent articles for official plugin extensions, including AIFlowGraph.
+- `$KB:flow:guide:official-plugins-index` lists all seven official plugins and their documentation.
 
 The FlowGraph plugin's `docs/` is its published site, separate from this agent knowledge base.
 
@@ -83,9 +83,8 @@ on the class itself, read through `FindFlowNodeTypes`. If an article you expect 
 so rather than reconstructing what it probably said.
 
 `agent-docs/Scripts/kb_lint.py` checks that every `$KB:` reference resolves and that each article's
-declared tag matches its filename. Pass every root the project uses in one invocation - a single
-root reports false failures on any reference that crosses roots. It is plain Python and needs no
-running editor.
+declared tag matches its filename. The official plugin articles share this root, so one invocation
+checks cross-plugin links together. It is plain Python and needs no running editor.
 
 ## Verifying a claim
 
@@ -95,10 +94,9 @@ how shipped content actually wires it; then, only if the catalog and usage don't
 owning source file. Never invent an API, pin name or property - state that you could not confirm it
 instead.
 
-## Domain skills
+## Extension skills
 
-A project-specific skill sits on top of this one. This file owns the mechanics above. A domain skill
-owns the judgment that only makes sense inside its domain: which structural model its asset subclass
-follows, its own vocabulary, and what may be assumed about its shipped content. When a request names
-a project's own asset subclass or content prefix, start from that skill, and come back here for
-generic node, addon and concept questions.
+An official extension's companion skill can sit on top of this one. This file owns generic Flow
+mechanics. A companion skill owns the structural model and vocabulary of the specialized asset
+subclass its plugin provides. When a request names that subclass, start from its companion skill,
+and come back here for generic node, addon and concept questions.

@@ -1,4 +1,4 @@
-# Flow Courier operations
+# FlowAgent operations
 
 Live-editor layer of the `flow` skill (see `../SKILL.md` for the core model). These operations are
 `UFlowMCPToolset` functions registered with Unreal's `ToolsetRegistry`. An MCP host can expose them
@@ -29,26 +29,26 @@ of `mutation.bDryRun`. A dry run has two further preconditions and both
 fail the call rather than quietly applying anyway: `bUseTransaction` must be true, because rollback
 is how a dry run undoes itself, and no editor transaction may already be open around the call.
 
-For a brand-new asset (no prior version), use `ImportAndRegraphFlowAsset` with a full Courier
+For a brand-new asset (no prior version), use `ImportAndRegraphFlowAsset` with a full FlowAgent
 document; never use it to edit an existing asset. Editing calls the ops below in `workflows.md`'s
 "standard loop" order.
 
 ## Ops
 
-- **`ExportFlowAsset`** - dumps a `UFlowAsset` to a Courier document in `exportedText`; its node
+- **`ExportFlowAsset`** - dumps a `UFlowAsset` to a FlowAgent document in `exportedText`; its node
   GUIDs are what you pass to `ApplyFlowPatch`. The payload is JSON, so parse it as JSON rather than
   line by line. Reserve for whole-graph review; when the request already names or implies specific
   nodes of interest, prefer `ExportFlowSubgraph` scoped to those nodes - it returns a much smaller,
   independently re-importable document instead of the entire asset.
-- **`ImportAndRegraphFlowAsset`** - creates a new FlowAsset from a full Courier document in
+- **`ImportAndRegraphFlowAsset`** - creates a new FlowAsset from a full FlowAgent document in
   `flowGraphText` and builds its editor graph. It rejects an occupied asset path and does not
   support dry runs. Use `ApplyFlowPatch` for an existing asset.
-- **`DescribeCourierGrammar`** - returns the legal Courier v2 op kinds and the required, optional,
+- **`DescribeFlowAgentGrammar`** - returns the legal FlowAgent v2 op kinds and the required, optional,
   and forbidden fields for each kind, plus document-level field rules. Call it before constructing
   a document when field legality is uncertain.
 - **`ApplyFlowPatch`** (`targetAssetPath`, `mutationText`, `mutation: { bDryRun }`) - GUID-keyed
   reconciler: applies only what `mutationText` names; everything else (identity, position, untouched
-  addons) is preserved. `mutationText` carries a Courier **JSON** document despite the field name.
+  addons) is preserved. `mutationText` carries a FlowAgent **JSON** document despite the field name.
   Supports upsert-by-GUID, delete ops, `newAlias` for nodes that do not exist yet, and pre-commit
   validation (any `Error` finding blocks a non-dry-run apply, asset left untouched).
   Always dry-run first. Returns `assetPath`, `bApplySucceeded`, `plan`
@@ -79,7 +79,7 @@ document; never use it to edit an existing asset. Editing calls the ops below in
 - **Duplicating a FlowAsset** uses the editor's asset duplication API, outside FlowAgentToolkit.
   Follow it with `ReconstructFlowGraph` on the new path before exporting or patching it.
 - **`DiffFlowAsset`** (`old`, `new`) - structured diff of two Flow graphs, no editor UI. Either arg
-  is an asset path or a raw Courier document. Returns
+  is an asset path or a raw FlowAgent document. Returns
   `bHasDifferences`, `addedNodes[]`, `removedNodes[]`, `changedNodes[]{nodeGuid,
   changedProperties{}, bPosChanged, oldPos?, newPos?, addonDiffs[]{addonGuid, parentGuid,
   changeType, addonType, changedProperties{}}}`, `addedConnections[]`, `removedConnections[]`. Use
@@ -89,7 +89,7 @@ document; never use it to edit an existing asset. Editing calls the ops below in
   and/or entry-point status. Prefer over a full `ExportFlowAsset` to locate nodes on a large graph.
 - **`ExportFlowSubgraph`** (`assetPath`, `startNodeGuid`) - exports just the connected region
   (undirected, exec and data edges) reachable from a start node as an independently re-importable
-  Courier document. A connected component can span the entire asset, so check its size before
+  FlowAgent document. A connected component can span the entire asset, so check its size before
   returning the raw document through a response-limited host.
 - **`PlanFlowSubgraphFromSelection`** (`targetAssetPath`, `selectionGuids[]`, `newAssetName`) -
   read-only preflight for the editor's exact "create sub-graph from selection" operation. The
@@ -127,7 +127,7 @@ document; never use it to edit an existing asset. Editing calls the ops below in
   rather than a structure - use `FindFlowNodes`/`FindFlowNodeTypes` for structure.
 - General asset discovery and Blueprint introspection come from the connected editor or MCP host.
   They are not FlowAgentToolkit operations. Use them when a task needs asset paths or Blueprint CDO
-  variables that Courier's class catalog does not expose.
+  variables that FlowAgent's class catalog does not expose.
 - **`CheckAddonAttachmentEligibility`** (`parentClassName`, `addonClassName`) - whether an AddOn can
   attach, via the same two-sided handshake the editor uses (parent and child each get a say).
   Accepts short or full class names. Returns `bEligible`, `result`
@@ -209,7 +209,7 @@ document; never use it to edit an existing asset. Editing calls the ops below in
   expensive part of the payload and are opt-in only.
 
 Mining corpus usage examples for KB articles is a KB-*authoring* concern, not a live-editing one -
-that recipe lives in a project's own domain skill, not here.
+that recipe lives in the owning official plugin's companion skill, not here.
 
 **Tool placement:** these operations live in `FlowAgentToolkit`'s `UFlowMCPToolset` and are
 registered under `FlowAgentToolkit.FlowMCPToolset`.

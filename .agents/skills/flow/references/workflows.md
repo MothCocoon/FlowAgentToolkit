@@ -11,7 +11,7 @@ next one runs.
 
 **A large asset's full `ExportFlowAsset` can exceed the host's response size limit.** If the host
 supports running a script beside the editor, export there and return a compact digest of the
-nodes, addons, and connections. Keep the complete Courier JSON available for the subsequent edit:
+nodes, addons, and connections. Keep the complete FlowAgent JSON available for the subsequent edit:
 
 ```python
 import json
@@ -81,7 +81,7 @@ Every archetype below is a variation of this. Do not vary the order.
 
 1. Read the current state: `ExportFlowAsset`, or `FindFlowNodes` plus `ExportFlowSubgraph` when the
    graph is large. You need real GUIDs and real pin names, not remembered ones.
-2. Write the smallest Courier v2 document that achieves the request. Omission means "leave alone",
+2. Write the smallest FlowAgent v2 document that achieves the request. Omission means "leave alone",
    so a small document is a safe one.
 3. `ApplyFlowPatch` with `mutation.bDryRun: true`. Read `bHasBlockingError`, then
    `validationFindings`, then the `plan` - and check the plan says what you meant, not merely that
@@ -221,7 +221,7 @@ When the cause or intended behavior is unclear, ask the graph owner before chang
 **Cloning preserves the classes in the source graph, including deprecated classes.** Check classes
 with `FindFlowNodeTypes` (`sections: "deprecation"`) before treating a clone as finished. Use
 `ReplaceFlowNodeClass` when a node needs a successor class: preview it with `mutation.bDryRun`,
-provide explicit property, pin, and addon mappings where needed, then apply and diff. A Courier
+provide explicit property, pin, and addon mappings where needed, then apply and diff. A FlowAgent
 `UpsertNode` cannot change an existing node's class; `ReplaceFlowNodeClass` is the dedicated path
 that preserves its GUID.
 

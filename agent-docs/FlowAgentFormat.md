@@ -35,12 +35,14 @@ it must match.
 
 `bWorldBound` and `expectedOwnerClass` are asset header values that round-trip.
 
-`assetProperties` is an optional map of explicitly registered asset-level property changes. It merges
-in both `Patch` and `Full` mode: omitting the map or one of its keys preserves the existing setting.
-Initially, only Encounter Flow assets accept `BlackboardAsset`. Its value is a full Blackboard object
-path or the string `"None"` to clear it. Unsupported properties, conflicting header representations,
-unresolvable paths, and references of the wrong class fail preflight before graph or asset changes.
-Full exports include the registered Blackboard setting so the value round-trips.
+`assetProperties` is an optional map of explicitly registered asset-level object-reference changes.
+An extension can register a property for an asset class with
+`FFlowAssetPropertyPolicy::RegisterObjectReferenceProperty`; accepted keys depend on active
+registrations, and this plugin does not register a default property. A value is a full object path or
+the string `"None"` to clear it. The map merges in both `Patch` and `Full` mode: omitting the map or
+one of its keys preserves the existing setting. Unsupported properties, conflicting header
+representations, unresolvable paths, and references of the wrong class fail preflight before graph
+or asset changes. Full exports include registered values so they round-trip.
 
 `scopeNodeGuids` belongs to `Patch` mode only. It names the nodes this document is authoritative
 over: a listed node with no `UpsertNode` op is deleted, exactly as if it had been delete-marked.
@@ -103,9 +105,10 @@ around a node it also deletes, with no ordering care.
 A pin is an object: `name`, `type`, and an optional `subCategoryPath` for a pin carrying a specific
 struct or enum type that must survive round-trip.
 
-**Pin names are carried verbatim.** They are never trimmed, normalised or special-cased. Some nodes
-deliberately use a whitespace-only name to render a blank pin label, and `"name": " "` expresses that
-with no ceremony.
+**Pin names are carried verbatim.** The `name` field is the pin's logical `PinName`, used by graph
+connections; it is never trimmed, normalised or special-cased. Some nodes deliberately use a
+whitespace-only name to render a blank pin label, and `"name": " "` expresses that with no ceremony.
+It is not the optional canvas label `PinFriendlyName`; see $KB:flow:concept:pin-identities.
 
 Declare a creating node's pins in `inputPins` and `outputPins`. An export carries them, so carrying
 them forward is the reliable move; the importer creates any declared pin that the class defaults do
@@ -175,14 +178,6 @@ Change one property:
              "properties": { "CooldownSeconds": "4.0" } } ] }
 ```
 
-Set an Encounter Flow asset's Blackboard without changing its graph:
-
-```json
-{ "formatVersion": 2, "mode": "Patch",
-  "assetProperties": { "BlackboardAsset": "/Game/Encounters/BB_Example.BB_Example" },
-  "ops": [] }
-```
-
 Insert a node between two others:
 
 ```json
@@ -238,3 +233,4 @@ its `EventName` without already knowing its GUID, use `FindFlowNodes` and read `
 ## See also
 
 - $KB:flow:guide:flowgraph-index
+- $KB:flow:concept:pin-identities

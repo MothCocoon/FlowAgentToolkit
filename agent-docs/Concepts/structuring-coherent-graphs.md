@@ -8,10 +8,8 @@ keywords: structure compose graph coherent decompose node addon pin entry point 
 Composition guidance for building a Flow graph that stays readable as it grows - the generic
 decision points every graph author faces regardless of `FlowAsset` subclass: when to add a new
 node vs. an addon vs. a new pin, when to split into multiple entry points vs. branch inline, and
-when to decompose into a sub-graph. This is the domain-agnostic counterpart to whatever
-project-specific graph-skeleton patterns exist for a project's own `FlowAsset` subclasses - those
-are *instances* of the general principles below; check a project's own domain-specific KB/skill
-content for concrete examples.
+when to decompose into a sub-graph. This is the domain-agnostic counterpart to specialized graph
+patterns an official extension may document for its own `FlowAsset` subclasses.
 
 ## New node, new addon, or new pin?
 
@@ -33,13 +31,13 @@ two shapes available:
 - **Multiple independent entry-rooted chains** sharing one graph canvas but not connected to each
   other - each entry Event/CustomInput roots its own sub-graph. This is the right shape when the
   triggers are genuinely independent and can fire in any order/combination, not sequenced relative
-  to each other. A project's own domain-specific entry-chain patterns (multiple named events or
-  phases sharing one graph) are typically instances of this shape.
+  to each other. An official extension's entry-chain patterns (multiple named events or phases
+  sharing one graph) are typically instances of this shape.
 - **A single entry with an inline `Branch`/`Switch`** - the right shape when the "different cases"
   are mutually exclusive alternatives *within* one triggered sequence, not independently-triggerable
   events. The underlying `FlowNode_Branch`/`FlowNode_Switch`/predicate-addon mechanics are generic
-  even where a project's own conditional-routing guidance illustrates them with project-specific
-  exemplars.
+  even where an official extension's conditional-routing guide illustrates them with its own
+  examples.
 
 Don't force independent triggers into a single entry point with a big branch just to avoid multiple
 entry nodes - that couples otherwise-unrelated trigger conditions into one node's gating logic, and

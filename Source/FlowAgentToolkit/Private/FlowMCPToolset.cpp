@@ -1947,7 +1947,7 @@ FFlowMCPDescribeFlowAgentGrammarResult UFlowMCPToolset::DescribeFlowAgentGrammar
 	Result.DocumentFields.Add(MakeFlowAgentField(TEXT("bWorldBound"), EFlowMCPAgentFieldLegality::Optional, FString()));
 	Result.DocumentFields.Add(MakeFlowAgentField(TEXT("expectedOwnerClass"), EFlowMCPAgentFieldLegality::Optional, FString()));
 	Result.DocumentFields.Add(MakeFlowAgentField(TEXT("assetProperties"), EFlowMCPAgentFieldLegality::Optional,
-		TEXT("Optional merge of registered asset-level properties. Omitted values are preserved in both modes; initially only Encounter BlackboardAsset accepts a full object path or \"None\".")));
+		TEXT("Optional merge of registered object-reference asset properties. Omitted values are preserved in both modes; values are full object paths or \"None\".")));
 	Result.DocumentFields.Add(MakeFlowAgentField(TEXT("scopeNodeGuids"), EFlowMCPAgentFieldLegality::Optional,
 		TEXT("Patch mode only: nodes this document is authoritative over. A listed node with no corresponding UpsertNode op is deleted. Illegal (ScopeWithFullMode) in Full mode, where the whole document is already authoritative.")));
 	Result.DocumentFields.Add(MakeFlowAgentField(TEXT("ops"), EFlowMCPAgentFieldLegality::Required, FString()));
